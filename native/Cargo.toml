@@ -1,0 +1,20 @@
+[package]
+name = "nativebridge"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "NativeBridge"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,19 @@
+# NativeBridge: Unity/C# aggregate native library (Rust implementation).
+#
+# This is a *local* source module (no upstream repo to fetch). build.ps1 sees
+# `local: true` and calls patch1.ps1 to stage the Rust sources into buildsrc/nativebridge
+# instead of calling fetch.ps1. It is built last, so every dependency's
+# $<lib>_install_dir global is already set and available to build1.ps1.
+ver: 0.1.0
+local: true
+cb_tool: custom
+
+# The Rust implementation currently bundles curlw unconditionally, so limit the
+# module to the target families implemented by build1.ps1.
+targets:
+  - win32
+  - linux
+  - android
+  - osx
+  - ios
+  - tvos

@@ -1,0 +1,8 @@
+ver: 1.25.0
+repo: https://github.com/ngtcp2/ngtcp2.git
+tag_prefix: v
+tag_dot2ul: false
+cb_tool: cmake
+options: -DENABLE_LIB_ONLY=ON -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DBUILD_TESTING=OFF -DENABLE_OPENSSL=OFF -DENABLE_PICOTLS=OFF -DENABLE_BORINGSSL=ON -DBORINGSSL_INCLUDE_DIR=$boringssl_install_dir/include -DBORINGSSL_LIBRARIES=$boringssl_install_dir/lib/ssl.lib;$boringssl_install_dir/lib/crypto.lib -DLIBNGHTTP3_INCLUDE_DIR=$nghttp3_install_dir/include -DLIBNGHTTP3_LIBRARY=$nghttp3_install_dir/lib/nghttp3.lib
+options_unix: -DBORINGSSL_LIBRARIES=$boringssl_install_dir/lib/libssl.a;$boringssl_install_dir/lib/libcrypto.a -DLIBNGHTTP3_LIBRARY=$nghttp3_install_dir/lib/libnghttp3.a
+options_cross: -DCMAKE_FIND_ROOT_PATH=$boringssl_install_dir;$nghttp3_install_dir

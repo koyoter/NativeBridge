@@ -1,0 +1,11 @@
+ver: 8.21.0
+repo: https://curl.se/download/curl-$ver.zip
+tag_prefix: curl-
+tag_dot2ul: true
+cb_tool: cmake
+options: -DZLIB_ROOT=$zlib_install_dir -DCURL_ZSTD=OFF -DCURL_BROTLI=OFF -DCURL_USE_LIBPSL=OFF -DCURL_DISABLE_LDAP=TRUE -DUSE_LIBIDN2=FALSE -DCURL_USE_LIBSSH2=FALSE -DBUILD_CURL_EXE=FALSE -DCURL_DISABLE_TESTS=TRUE -DCURL_DISABLE_WEBSOCKETS=OFF -DCURL_USE_OPENSSL=TRUE -DOPENSSL_ROOT_DIR=$boringssl_install_dir -DHAVE_SSL_SET_QUIC_USE_LEGACY_CODEPOINT=TRUE -DUSE_NGHTTP2=ON -DNGHTTP2_INCLUDE_DIR=$nghttp2_install_dir/include -DNGHTTP2_LIBRARY=$nghttp2_install_dir/lib/nghttp2.lib -DUSE_NGTCP2=ON -DNGTCP2_INCLUDE_DIR=$ngtcp2_install_dir/include -DNGTCP2_LIBRARY=$ngtcp2_install_dir/lib/ngtcp2.lib -DUSE_NGHTTP3=ON -DNGHTTP3_INCLUDE_DIR=$nghttp3_install_dir/include -DNGHTTP3_LIBRARY=$nghttp3_install_dir/lib/nghttp3.lib
+options_cross: -DCMAKE_FIND_ROOT_PATH=$boringssl_install_dir;$nghttp2_install_dir;$nghttp3_install_dir;$ngtcp2_install_dir
+options_unix: -DBUILD_SHARED_LIBS=OFF -DNGHTTP2_LIBRARY=$nghttp2_install_dir/lib/libnghttp2.a -DNGTCP2_LIBRARY=$ngtcp2_install_dir/lib/libngtcp2.a -DNGHTTP3_LIBRARY=$nghttp3_install_dir/lib/libnghttp3.a
+# curl is consumed only by nativebridge, which inlines it into a single
+# self-contained library, so keep it static on Windows too (matches options_unix).
+options_msw: -DBUILD_SHARED_LIBS=OFF

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- IDE / 独立编译入口。Unity 内走 NativeBridgeF.asmdef；打包时 dist1.sh
+       只拷贝 .cs/.asmdef，本文件不会进 Unity 包。 -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>NativeBridge</RootNamespace>
+  </PropertyGroup>
+
+</Project>

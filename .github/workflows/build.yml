@@ -1,0 +1,433 @@
+name: NativeBridge
+
+# Builds the NativeBridge aggregate native library (curlw/vfs/dlmgr modules)
+# for every Unity target platform, then assembles a NativeBridge-<ver>.zip Unity
+# package and publishes it to the tag's release.
+#
+# Push a tag to build & release:
+#   bump native/build.yml `ver:` -> commit -> git tag v<ver> && git push origin v<ver>
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GH_XCODE_VER: 16.4
+  VS_DEPLOYMENT_TARGET: 10.0.17763.0
+
+jobs:
+  win32:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64]
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_win32_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          # Cache ONLY the C dependency libs (zlib, boringssl, nghttp3, ngtcp2,
+          # nghttp2, curl). nativebridge itself is always rebuilt (see the
+          # "Force nativebridge rebuild" step below), so the key hashes only the
+          # inputs that affect those deps. Editing nativebridge sources keeps the
+          # key stable -> the cached deps are restored and build.ps1 skips them
+          # (via each lib's _1kiss version sentry) instead of recompiling.
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1 -p win32 -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  win32-arm64:
+    runs-on: windows-11-arm
+    env:
+      INSTALL_PATH: install_win32_arm64
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1 -p win32 -a arm64
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_linux_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p linux -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [armv7, arm64, x86, x64]
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_android_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup NDK
+        shell: pwsh
+        run: ./1k/1kiss.ps1 -p android -a $env:BUILD_ARCH -setupOnly -ndkOnly
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p android -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  osx:
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_osx_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p osx -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  ios:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        arch: [arm64, x64]
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_ios_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '${{ env.GH_XCODE_VER }}'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p ios -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  ios-arm64-sim:
+    runs-on: macos-15
+    env:
+      INSTALL_PATH: install_ios_arm64_sim
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '${{ env.GH_XCODE_VER }}'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p ios -a arm64 -sdk simulator
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  tvos:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        arch: [arm64, x64]
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_tvos_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '${{ env.GH_XCODE_VER }}'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p tvos -a $env:BUILD_ARCH
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  tvos-arm64-sim:
+    runs-on: macos-15
+    env:
+      INSTALL_PATH: install_tvos_arm64_sim
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '${{ env.GH_XCODE_VER }}'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -p tvos -a arm64 -sdk simulator
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          path: ./${{ env.install_path }}/**
+          name: ${{ env.install_path }}
+
+  # Assemble the Unity package from all platform artifacts and publish it to
+  # the pushed tag's release.
+  dist:
+    needs: [win32, win32-arm64, linux, android, osx, ios, ios-arm64-sim, tvos, tvos-arm64-sim]
+    runs-on: macos-latest  # needs lipo + xcodebuild for the xcframework
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve version from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+      - name: Verify tag matches native/build.yml version
+        shell: bash
+        run: |
+          conf_ver="$(grep -E '^ver:' native/build.yml | sed 's/^ver:[[:space:]]*//')"
+          echo "tag version=$VERSION, native/build.yml ver=$conf_ver"
+          if [ "$VERSION" != "$conf_ver" ]; then
+            echo "::error::tag v$VERSION != native/build.yml ver $conf_ver — bump native/build.yml and re-tag"
+            exit 1
+          fi
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: _artifacts
+      - name: Flatten artifacts to install_* dirs
+        shell: bash
+        run: |
+          for d in _artifacts/install_*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")
+            rm -rf "./$base"
+            mv "$d" "./$base"
+          done
+          ls -d install_* || true
+      - name: Assemble NativeBridge package
+        shell: bash
+        run: bash pack/dist1.sh "$VERSION"
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: NativeBridge-${{ env.VERSION }}
+          path: ${{ env.NB_DIST_ZIP }}
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: ${{ env.NB_DIST_ZIP }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

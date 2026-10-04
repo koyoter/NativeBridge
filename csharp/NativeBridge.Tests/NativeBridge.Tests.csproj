@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <_nbArch>$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLower())</_nbArch>
+  </PropertyGroup>
+
+  <!-- 被测源码：csharp/NativeBridge/ 是唯一权威实现（native/Runtime 只是打包副本，不参与编译） -->
+  <ItemGroup>
+    <Compile Remove="native/**/*.cs" />
+    <Compile Include="..\NativeBridge\*.cs" LinkBase="NativeBridgeF" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="NUnit" Version="4.2.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- 把用户投喂到 native/Plugins 的 native 库按当前平台复制到测试输出目录，
+       P/Invoke 的 "NativeBridge" 走默认探测规则即可解析。 -->
+  <Target Name="CopyNativeBridgeWin" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <ItemGroup>
+      <_nbLib Condition="'$(_nbArch)' == 'arm64'" Include="$(MSBuildProjectDirectory)\native\Plugins\Windows\ARM64\NativeBridge.dll" />
+      <_nbLib Condition="'$(_nbArch)' != 'arm64'" Include="$(MSBuildProjectDirectory)\native\Plugins\Windows\x86_64\NativeBridge.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_nbLib)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyNativeBridgeLinux" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <ItemGroup>
+      <_nbLib Condition="'$(_nbArch)' == 'arm64'" Include="$(MSBuildProjectDirectory)\native\Plugins\Linux\ARM64\libNativeBridge.so" />
+      <_nbLib Condition="'$(_nbArch)' != 'arm64'" Include="$(MSBuildProjectDirectory)\native\Plugins\Linux\x86_64\libNativeBridge.so" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_nbLib)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyNativeBridgeMac" AfterTargets="Build" Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <ItemGroup>
+      <_nbLib Include="$(MSBuildProjectDirectory)\native\Plugins\macOS\NativeBridge.dylib" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_nbLib)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

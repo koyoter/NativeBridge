@@ -1,0 +1,6 @@
+ver: 1.18.0
+repo: https://github.com/ngtcp2/nghttp3.git
+tag_prefix: v
+tag_dot2ul: false
+cb_tool: cmake
+options: -DENABLE_LIB_ONLY=ON -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DBUILD_TESTING=OFF

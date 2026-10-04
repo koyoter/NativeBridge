@@ -1,0 +1,7 @@
+ver: 0.20260803.0
+repo: https://github.com/google/boringssl.git
+tag_prefix: ''
+tag_dot2ul: false
+cb_tool: cmake
+options: -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+options_unix: -DCMAKE_POSITION_INDEPENDENT_CODE=ON

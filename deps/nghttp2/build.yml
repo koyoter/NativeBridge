@@ -1,0 +1,12 @@
+ver: 1.70.0
+repo: https://github.com/nghttp2/nghttp2.git
+tag_prefix: v
+tag_dot2ul: false
+cb_tool: cmake
+# nghttp2 1.70.0 dropped the old ENABLE_STATIC_LIB/ENABLE_SHARED_LIB options and
+# now keys off the standard BUILD_STATIC_LIBS / BUILD_SHARED_LIBS. We consume only
+# the static archive (libnghttp2.a / nghttp2.lib), so build static-only. Leaving
+# the old flags would silently produce a shared lib with no archive, breaking
+# curl's and NativeBridge's static link. (ENABLE_STATIC_LIB kept as a harmless
+# no-op for older nghttp2 tags.)
+options: -DENABLE_LIB_ONLY=ON -DBUILD_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DBUILD_TESTING=OFF -DENABLE_DOC=OFF

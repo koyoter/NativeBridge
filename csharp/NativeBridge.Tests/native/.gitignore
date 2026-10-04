@@ -1,0 +1,4 @@
+# 用户手动拷入的 native 库不入库
+*
+!.gitignore
+!README.md
