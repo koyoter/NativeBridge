@@ -244,6 +244,14 @@ if ($target_os -eq 'android') {
     $linker_var = 'CARGO_TARGET_' + ($rust_target.ToUpper() -replace '-', '_') + '_LINKER'
     Set-Item -Path "env:$linker_var" -Value $android_linker
     Write-Host "  android_linker=$android_linker ($linker_var)"
+
+    # Android 15+ supports 16KB memory pages; the ELF LOAD segments of every
+    # shipped .so must then be 16KB-aligned or the library crashes on load.
+    # lld defaults to max-page-size=4096, so force 16KB explicitly (NDK r28+
+    # defaults this for arm64 only). Works unchanged on 4KB-page devices.
+    $rustflags_var = 'CARGO_TARGET_' + ($rust_target.ToUpper() -replace '-', '_') + '_RUSTFLAGS'
+    Set-Item -Path "env:$rustflags_var" -Value '-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384'
+    Write-Host "  $rustflags_var=16KB page alignment"
 }
 elseif ($target_os -eq 'osx' -or $target_os -eq 'ios' -or $target_os -eq 'tvos' -or $target_os -eq 'watchos') {
     # The dependency C libraries (curl, boringssl, ...) are compiled by
