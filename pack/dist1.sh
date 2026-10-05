@@ -192,7 +192,13 @@ META_TEXT='TextScriptImporter:
   assetBundleName: 
   assetBundleVariant:'
 
-plugin_meta() { # dst guid spec...  spec = Platform|enabled|cpu (cpu may be empty)
+plugin_meta() { # dst guid spec...  spec = first-key|first-value|cpu (cpu may be empty)
+    # Unity parses each `first` map as platform-name -> platform-name pairs
+    # (`Editor: Editor`, `Standalone: Win64`); `Any:` is the lone empty-value
+    # entry. Names and CPU values must be Unity's exact serialized form — one
+    # unrecognized entry and the deserializer drops the WHOLE platformData and
+    # resets the importer to Any Platform (the v0.1.0 import error). Platforms
+    # not listed stay disabled; keep the Any:0 entry or they all turn on.
     local dst="$1" guid="$2"; shift 2
     {
         printf 'fileFormatVersion: 2\nguid: %s\n' "$guid"
@@ -203,14 +209,14 @@ plugin_meta() { # dst guid spec...  spec = Platform|enabled|cpu (cpu may be empt
         printf '  isPreloaded: 0\n  isOverridable: 0\n  isExplicitlyReferenced: 0\n  validateReferences: 1\n'
         printf '  platformData:\n'
         printf '  - first:\n      Any: \n    second:\n      enabled: 0\n      settings: {}\n'
-        local spec name rest enabled cpu
+        local spec key rest val cpu
         for spec in "$@"; do
-            name="${spec%%|*}"
+            key="${spec%%|*}"
             rest="${spec#*|}"
-            enabled="${rest%%|*}"
+            val="${rest%%|*}"
             cpu="${rest#*|}"
             [ "$cpu" = "$rest" ] && cpu=''
-            printf '  - first:\n      %s: \n      %s: \n    second:\n      enabled: %s\n' "$name" "$name" "$enabled"
+            printf '  - first:\n      %s: %s\n    second:\n      enabled: 1\n' "$key" "$val"
             if [ -n "$cpu" ]; then
                 printf '      settings:\n        CPU: %s\n' "$cpu"
             else
@@ -229,8 +235,8 @@ gen_meta() { # absolute path under $OUT
     # directory check or they'd get a folderAsset meta and Unity would try to
     # import their contents individually.
     case "$rel" in
-        Plugins/iOS/*.xcframework)  plugin_meta "$p.meta" "$guid" 'iPhone|1|'; return ;;
-        Plugins/tvOS/*.xcframework) plugin_meta "$p.meta" "$guid" 'tvOS|1|'; return ;;
+        Plugins/iOS/*.xcframework)  plugin_meta "$p.meta" "$guid" 'iPhone|iPhone|'; return ;;
+        Plugins/tvOS/*.xcframework) plugin_meta "$p.meta" "$guid" 'tvOS|tvOS|'; return ;;
     esac
     if [ -d "$p" ]; then
         write_meta "$p.meta" "$guid" "$META_FOLDER"
@@ -243,19 +249,16 @@ gen_meta() { # absolute path under $OUT
         *)
             # Editor entries: only where the binary can actually load in an
             # editor (x64 Windows/Linux editors, macOS universal). Absent
-            # platforms stay disabled via the Any:0 default.
+            # platforms stay disabled via the Any:0 entry.
             case "$rel" in
-                Plugins/Windows/x86_64/*)     plugin_meta "$p.meta" "$guid" 'Windows|1|X86_64' 'Editor|1|X86_64' ;;
-                Plugins/Windows/ARM64/*)      plugin_meta "$p.meta" "$guid" 'Windows|1|ARM64' ;;
-                Plugins/Linux/x86_64/*)       plugin_meta "$p.meta" "$guid" 'Linux|1|X86_64' 'Editor|1|X86_64' ;;
-                Plugins/Linux/ARM64/*)        plugin_meta "$p.meta" "$guid" 'Linux|1|ARM64' ;;
-                Plugins/Android/arm64-v8a/*)  plugin_meta "$p.meta" "$guid" 'Android|1|ARM64' ;;
-                Plugins/Android/armeabi-v7a/*) plugin_meta "$p.meta" "$guid" 'Android|1|ARMv7' ;;
-                Plugins/Android/x86_64/*)     plugin_meta "$p.meta" "$guid" 'Android|1|X86_64' ;;
-                Plugins/Android/x86/*)        plugin_meta "$p.meta" "$guid" 'Android|1|X86' ;;
-                Plugins/macOS/*)              plugin_meta "$p.meta" "$guid" 'OSX|1|' 'Editor|1|' ;;
-                Plugins/iOS/*)                plugin_meta "$p.meta" "$guid" 'iPhone|1|' ;;
-                Plugins/tvOS/*)               plugin_meta "$p.meta" "$guid" 'tvOS|1|' ;;
+                Plugins/Windows/x86_64/*)     plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64' 'Standalone|Win64|x86_64' ;;
+                Plugins/Windows/ARM64/*)      plugin_meta "$p.meta" "$guid" 'Standalone|Win64|ARM64' ;;
+                Plugins/Linux/x86_64/*)       plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64' 'Standalone|Linux64|x86_64' ;;
+                Plugins/Linux/ARM64/*)        plugin_meta "$p.meta" "$guid" 'Standalone|Linux64|ARM64' ;;
+                Plugins/Android/*)            plugin_meta "$p.meta" "$guid" 'Android|Android|' ;;
+                Plugins/macOS/*)              plugin_meta "$p.meta" "$guid" 'Editor|Editor|AnyCPU' 'Standalone|OSXUniversal|AnyCPU' ;;
+                Plugins/iOS/*)                plugin_meta "$p.meta" "$guid" 'iPhone|iPhone|' ;;
+                Plugins/tvOS/*)               plugin_meta "$p.meta" "$guid" 'tvOS|tvOS|' ;;
                 *)
                     echo "WARN: no Unity importer template for '$rel'; meta not written"
                     ;;
