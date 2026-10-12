@@ -7,6 +7,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using NUnit.Framework;
@@ -60,7 +61,106 @@ namespace NativeBridgeF.Tests
                         (CurlwWriteDataDelegate)WriteBody), Is.EqualTo(CURLcode.CURLE_OK));
         }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static WeakReference SetCallbackAndDuplicate(IntPtr easy, out IntPtr duplicate)
+        {
+            int captured = 1;
+            CurlwWriteDataDelegate callback = (content, size, nmemb, userdata) =>
+            {
+                GC.KeepAlive(captured);
+                return UIntPtr.Zero;
+            };
+            var weak = new WeakReference(callback);
+            Assert.That(CurlwDLL.curlw_easy_setopt_pointer(easy, CURLoption.CURLOPT_WRITEFUNCTION, callback),
+                        Is.EqualTo(CURLcode.CURLE_OK));
+            duplicate = CurlwDLL.curlw_easy_duphandle(easy);
+            return weak;
+        }
+
         // --- tests -----------------------------------------------------------------
+
+        [Test]
+        public void Easy_DuplicateKeepsCallbackAliveAfterOriginalCleanup()
+        {
+            IntPtr original = CurlwDLL.curlw_easy_init();
+            Assert.That(original, Is.Not.EqualTo(IntPtr.Zero));
+            IntPtr duplicate = IntPtr.Zero;
+            try
+            {
+                WeakReference callback = SetCallbackAndDuplicate(original, out duplicate);
+                Assert.That(duplicate, Is.Not.EqualTo(IntPtr.Zero));
+                CurlwDLL.curlw_easy_cleanup(original);
+                original = IntPtr.Zero;
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                Assert.That(callback.IsAlive, Is.True, "Duplicate must root the copied callback.");
+                // Do not perform a transfer: a regression must never invoke a freed callback.
+            }
+            finally
+            {
+                if (original != IntPtr.Zero) CurlwDLL.curlw_easy_cleanup(original);
+                if (duplicate != IntPtr.Zero) CurlwDLL.curlw_easy_cleanup(duplicate);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void BufferEntryPoints_RejectOversizedLengthsAndClearOutputs(bool nullBuffer)
+        {
+            byte[] buffer = nullBuffer ? null : new byte[1];
+            UIntPtr size = (UIntPtr)2;
+            UIntPtr count = (UIntPtr)123;
+            IntPtr meta = (IntPtr)123;
+            Assert.That(CurlwDLL.curlw_easy_send(IntPtr.Zero, buffer, size, out count),
+                        Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+            Assert.That(count, Is.EqualTo(UIntPtr.Zero));
+            count = (UIntPtr)123;
+            Assert.That(CurlwDLL.curlw_easy_recv(IntPtr.Zero, buffer, size, out count),
+                        Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+            Assert.That(count, Is.EqualTo(UIntPtr.Zero));
+            count = (UIntPtr)123;
+            Assert.That(CurlwDLL.curlw_ws_send(IntPtr.Zero, buffer, size, out count, 0, 0),
+                        Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+            Assert.That(count, Is.EqualTo(UIntPtr.Zero));
+            count = (UIntPtr)123;
+            Assert.That(CurlwDLL.curlw_ws_recv(IntPtr.Zero, buffer, size, out count, out meta),
+                        Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+            Assert.That(count, Is.EqualTo(UIntPtr.Zero));
+            Assert.That(meta, Is.EqualTo(IntPtr.Zero));
+        }
+
+        [Test]
+        public void MimeData_ValidatesArraySizeButPreservesNullSemantics()
+        {
+            IntPtr easy = CurlwDLL.curlw_easy_init();
+            Assert.That(easy, Is.Not.EqualTo(IntPtr.Zero));
+            IntPtr mime = IntPtr.Zero;
+            try
+            {
+                mime = CurlwDLL.curlw_mime_init(easy);
+                Assert.That(mime, Is.Not.EqualTo(IntPtr.Zero));
+                IntPtr part = CurlwDLL.curlw_mime_addpart(mime);
+                Assert.That(part, Is.Not.EqualTo(IntPtr.Zero));
+                byte[] data = new byte[] { 1, 0 };
+                Assert.That(CurlwDLL.curlw_mime_data(part, data, (UIntPtr)data.Length),
+                            Is.EqualTo(CURLcode.CURLE_OK));
+                Assert.That(CurlwDLL.curlw_mime_data(part, data, (UIntPtr)3),
+                            Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+                UIntPtr zeroTerminated = UIntPtr.Size == 8
+                    ? new UIntPtr(ulong.MaxValue) : new UIntPtr(uint.MaxValue);
+                Assert.That(CurlwDLL.curlw_mime_data(part, data, zeroTerminated),
+                            Is.EqualTo(CURLcode.CURLE_BAD_FUNCTION_ARGUMENT));
+                Assert.That(CurlwDLL.curlw_mime_data(part, null, zeroTerminated),
+                            Is.EqualTo(CURLcode.CURLE_OK));
+            }
+            finally
+            {
+                if (mime != IntPtr.Zero) CurlwDLL.curlw_mime_free(mime);
+                CurlwDLL.curlw_easy_cleanup(easy);
+            }
+        }
 
         /// <summary>
         /// 测试重点：curlw ABI 版本守卫为 1，version_info 指针有效且

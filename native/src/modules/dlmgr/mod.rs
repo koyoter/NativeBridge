@@ -14,6 +14,7 @@ pub(crate) mod sink;
 pub(crate) mod task;
 pub(crate) mod worker;
 
+use std::cell::Cell;
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::CStr;
 use std::ptr;
@@ -24,27 +25,53 @@ use std::thread::JoinHandle;
 use libc::{c_char, c_void};
 
 use crate::modules::curlw::{
-    curlw_share_cleanup, curlw_share_enable_default_locks, curlw_share_init,
-    curlw_share_setopt_int,
+    curlw_share_cleanup, curlw_share_enable_default_locks, curlw_share_init, curlw_share_setopt_int,
 };
-use curlw_backend::{CURL_LOCK_DATA_DNS, CURLSHOPT_SHARE};
+use curlw_backend::{CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS};
 use rate::SpeedLimiter;
 use sink::FileSink;
-use task::{
-    HeapTask, TaskShared, ERR_CANCELED, TASK_CANCELED, TASK_RUNNING, TASK_VERIFYING,
-};
+use task::{HeapTask, TaskShared, ERR_CANCELED, TASK_CANCELED, TASK_RUNNING, TASK_VERIFYING};
 
 /// 任务回调：`cb(user, task_id, state, done, total, bps, err)`。
 pub(crate) type DlmgrTaskCb = unsafe extern "C" fn(*mut c_void, u64, i32, u64, u64, u64, i32);
 /// 全局回调：`cb(user, active, done_cnt, failed_cnt, bytes_done, bytes_total, bps)`。
-pub(crate) type DlmgrGlobalCb =
-    unsafe extern "C" fn(*mut c_void, u32, u32, u32, u64, u64, u64);
+pub(crate) type DlmgrGlobalCb = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u64, u64, u64);
 
 /// 跨线程持有的裸指针（回调 user / curl share 句柄）：仅存取，不解引用。
 #[derive(Clone, Copy)]
 pub(crate) struct SendPtr(pub(crate) *mut c_void);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
+
+// Mark dlmgr-owned threads at their entry point, before callbacks can run. The Arc's
+// allocation has a stable address even before its JoinHandle is stored (or after it
+// is taken by shutdown). Reject shutdown of *any* manager from these threads: a
+// reporter callback shutting down a different manager could join a reporter that
+// is waiting on this one, and workers can re-enter through sink callbacks.
+thread_local! {
+    static INTERNAL_MANAGER: Cell<*const Shared> = Cell::new(ptr::null());
+}
+
+pub(crate) struct InternalThreadGuard {
+    previous: *const Shared,
+}
+
+impl InternalThreadGuard {
+    fn enter(sh: &Arc<Shared>) -> Self {
+        let previous = INTERNAL_MANAGER.with(|current| {
+            let previous = current.get();
+            current.set(Arc::as_ptr(sh));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for InternalThreadGuard {
+    fn drop(&mut self) {
+        INTERNAL_MANAGER.with(|current| current.set(self.previous));
+    }
+}
 
 struct QueueState {
     heap: BinaryHeap<HeapTask>,
@@ -81,7 +108,12 @@ pub(crate) struct Shared {
 impl Shared {
     fn new(worker_count: u32, global_bps: u64, retry_count: u32, share: *mut c_void) -> Shared {
         Shared {
-            queue: Mutex::new(QueueState { heap: BinaryHeap::new(), paused: false, shutdown: false, next_seq: 0 }),
+            queue: Mutex::new(QueueState {
+                heap: BinaryHeap::new(),
+                paused: false,
+                shutdown: false,
+                next_seq: 0,
+            }),
             cv: Condvar::new(),
             tasks: Mutex::new(HashMap::new()),
             limiter: SpeedLimiter::new(global_bps),
@@ -143,7 +175,11 @@ impl Shared {
             .map(|ht| {
                 if ht.task.id == id {
                     changed = true;
-                    HeapTask { priority, seq: ht.seq, task: ht.task }
+                    HeapTask {
+                        priority,
+                        seq: ht.seq,
+                        task: ht.task,
+                    }
                 } else {
                     ht
                 }
@@ -194,7 +230,11 @@ unsafe fn cstr_to_string(p: *const c_char) -> Option<String> {
 /// 创建管理器；返回 opaque 句柄（Box<Arc<Shared>>），失败返回 NULL。
 /// worker_count 会被夹到 1..=64；global_bps=0 不限速；retry_count 为重试预算（默认 3）。
 #[no_mangle]
-pub unsafe extern "C" fn dlmgr_create(worker_count: u32, global_bps: u64, retry_count: u32) -> *mut c_void {
+pub unsafe extern "C" fn dlmgr_create(
+    worker_count: u32,
+    global_bps: u64,
+    retry_count: u32,
+) -> *mut c_void {
     // 全局一个 share（DNS 缓存共享）+ 默认锁集
     let share = curlw_share_init();
     if share.is_null() {
@@ -206,7 +246,12 @@ pub unsafe extern "C" fn dlmgr_create(worker_count: u32, global_bps: u64, retry_
         curlw_share_cleanup(share);
         return ptr::null_mut();
     }
-    let boxed = Box::into_raw(Box::new(Arc::new(Shared::new(worker_count, global_bps, retry_count, share))));
+    let boxed = Box::into_raw(Box::new(Arc::new(Shared::new(
+        worker_count,
+        global_bps,
+        retry_count,
+        share,
+    ))));
     boxed as *mut c_void
 }
 
@@ -214,7 +259,9 @@ pub unsafe extern "C" fn dlmgr_create(worker_count: u32, global_bps: u64, retry_
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_add_doh_url(mgr: *mut c_void, url: *const c_char) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    let Some(url) = cstr_to_string(url) else { return -1 };
+    let Some(url) = cstr_to_string(url) else {
+        return -1;
+    };
     if url.is_empty() {
         return -1;
     }
@@ -251,7 +298,9 @@ pub unsafe extern "C" fn dlmgr_enqueue(
     task_id: *mut u64,
 ) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    let Some(range_url) = cstr_to_string(range_url) else { return -1 };
+    let Some(range_url) = cstr_to_string(range_url) else {
+        return -1;
+    };
     if range_url.is_empty() {
         return -1;
     }
@@ -266,11 +315,17 @@ pub unsafe extern "C" fn dlmgr_enqueue(
             return -1;
         }
         let id = sh.next_task_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let t = Arc::new(TaskShared::new(id, name, range_url, full_url, size, crc32, task_bps, sink));
+        let t = Arc::new(TaskShared::new(
+            id, name, range_url, full_url, size, crc32, task_bps, sink,
+        ));
         sh.tasks.lock().unwrap().insert(id, t.clone());
         q.next_seq += 1;
         let seq = q.next_seq;
-        q.heap.push(HeapTask { priority, seq, task: t });
+        q.heap.push(HeapTask {
+            priority,
+            seq,
+            task: t,
+        });
         if !task_id.is_null() {
             *task_id = id;
         }
@@ -310,7 +365,11 @@ pub unsafe extern "C" fn dlmgr_cancel_all(mgr: *mut c_void) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_set_priority(mgr: *mut c_void, task_id: u64, priority: i32) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    if sh.set_priority(task_id, priority) { 0 } else { -1 }
+    if sh.set_priority(task_id, priority) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// 暂停派发（运行中跑完）；C# 以 active_count==0 作为整理前置。
@@ -340,7 +399,11 @@ pub unsafe extern "C" fn dlmgr_set_global_speed(mgr: *mut c_void, bps: u64) -> i
 
 /// 任务级回调（可传 NULL 清除）。reporter 线程 10Hz 触发；delegate 由宿主保活。
 #[no_mangle]
-pub unsafe extern "C" fn dlmgr_set_task_callback(mgr: *mut c_void, cb: Option<DlmgrTaskCb>, user: *mut c_void) -> i32 {
+pub unsafe extern "C" fn dlmgr_set_task_callback(
+    mgr: *mut c_void,
+    cb: Option<DlmgrTaskCb>,
+    user: *mut c_void,
+) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
     *sh.task_cb.lock().unwrap() = cb.map(|f| (f, SendPtr(user)));
     0
@@ -348,7 +411,11 @@ pub unsafe extern "C" fn dlmgr_set_task_callback(mgr: *mut c_void, cb: Option<Dl
 
 /// 全局回调（可传 NULL 清除）。先逐任务后全局；delegate 由宿主保活。
 #[no_mangle]
-pub unsafe extern "C" fn dlmgr_set_global_callback(mgr: *mut c_void, cb: Option<DlmgrGlobalCb>, user: *mut c_void) -> i32 {
+pub unsafe extern "C" fn dlmgr_set_global_callback(
+    mgr: *mut c_void,
+    cb: Option<DlmgrGlobalCb>,
+    user: *mut c_void,
+) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
     *sh.global_cb.lock().unwrap() = cb.map(|f| (f, SendPtr(user)));
     0
@@ -372,9 +439,15 @@ pub unsafe extern "C" fn dlmgr_active_count(mgr: *mut c_void) -> u32 {
 /// 注册 FileSink（每任务独立 OS 句柄，pwrite 落普通文件）；失败返回 0。
 /// 终态后由宿主调 sink_release(h) 回收。
 #[no_mangle]
-pub unsafe extern "C" fn dlmgr_sink_create_file(mgr: *mut c_void, path: *const c_char, size: u64) -> u64 {
+pub unsafe extern "C" fn dlmgr_sink_create_file(
+    mgr: *mut c_void,
+    path: *const c_char,
+    size: u64,
+) -> u64 {
     let _ = mgr; // 保留 ABI 位置（§3.1）；FileSink 自包含
-    let Some(path) = cstr_to_string(path) else { return 0 };
+    let Some(path) = cstr_to_string(path) else {
+        return 0;
+    };
     FileSink::create(&path, size).unwrap_or(0)
 }
 
@@ -385,11 +458,30 @@ pub unsafe extern "C" fn dlmgr_sink_release(sink: u64) {
     sink::sink_release(sink);
 }
 
-/// 优雅关闭：cancel_all + join 全部线程 + 释放 share，最后消费 mgr 句柄（此后失效）。
-/// 无死锁：worker 经取消旗标快速退出当前任务，随后在 take_task 看到 shutdown 退出。
+/// Legacy void ABI. Same behavior as dlmgr_shutdown_try, but rejection is a no-op:
+/// the handle remains live. Callers needing a result (especially callbacks) must
+/// use dlmgr_shutdown_try and arrange shutdown on an external thread.
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_shutdown(mgr: *mut c_void) {
-    let Some(sh) = shared(mgr) else { return };
+    let _ = dlmgr_shutdown_try(mgr);
+}
+
+/// Cancel all tasks, join workers/reporter, release share, and consume mgr.
+/// Returns 0 on success (NULL is a successful no-op), -1 from ANY dlmgr internal
+/// worker/reporter thread, including sink/VFS commit callbacks. Rejection changes
+/// no state and does not consume the handle, even during an external shutdown.
+/// The all-manager restriction prevents cross-manager join cycles as well as
+/// self-joins. Dispatch shutdown to an external thread; callbacks must not wait
+/// for that shutdown to finish. The host must serialize external shutdown with
+/// other handle use (including start and another shutdown); success invalidates mgr.
+/// Additive export: the legacy void ABI and DLMGR_ABI_VERSION remain unchanged.
+#[no_mangle]
+pub unsafe extern "C" fn dlmgr_shutdown_try(mgr: *mut c_void) -> i32 {
+    // Check TLS before dereferencing mgr, acquiring locks, or taking join handles.
+    if INTERNAL_MANAGER.with(|current| !current.get().is_null()) {
+        return -1;
+    }
+    let Some(sh) = shared(mgr) else { return 0 };
     {
         let mut q = sh.queue.lock().unwrap();
         q.shutdown = true;
@@ -405,17 +497,52 @@ pub unsafe extern "C" fn dlmgr_shutdown(mgr: *mut c_void) {
     // Release 配对 reporter 的 Acquire：stop 可见时全部 worker 的终态写入必已可见，
     // reporter 的最终补拍才能把最后一批终态发出去。
     sh.reporter_stop.store(true, Ordering::Release);
-    if let Some(r) = sh.reporter.lock().unwrap().take() {
+    let reporter = sh.reporter.lock().unwrap().take();
+    if let Some(r) = reporter {
         let _ = r.join();
     }
 
     curlw_share_cleanup(sh.share.0); // worker 已全部退出
     drop(Box::from_raw(mgr as *mut Arc<Shared>));
+    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_thread_guard_restores_identity_and_rejects_any_manager() {
+        let first = Arc::new(Shared::new(1, 0, 0, ptr::null_mut()));
+        let second = Arc::new(Shared::new(1, 0, 0, ptr::null_mut()));
+        let mut first_handle = Box::new(first.clone());
+        let mut second_handle = Box::new(second.clone());
+        let first_ptr = &mut *first_handle as *mut Arc<Shared> as *mut c_void;
+        let second_ptr = &mut *second_handle as *mut Arc<Shared> as *mut c_void;
+        assert!(INTERNAL_MANAGER.with(|current| current.get().is_null()));
+        {
+            let _guard = InternalThreadGuard::enter(&first);
+            assert_eq!(INTERNAL_MANAGER.with(Cell::get), Arc::as_ptr(&first));
+            // Neither manager has any stored JoinHandles. Rejection must not
+            // depend on handle publication or consume/mutate either manager.
+            assert_eq!(unsafe { dlmgr_shutdown_try(first_ptr) }, -1);
+            assert_eq!(unsafe { dlmgr_shutdown_try(second_ptr) }, -1);
+            unsafe { dlmgr_shutdown(first_ptr) }; // legacy void ABI must also no-op
+            assert!(!first.queue.lock().unwrap().shutdown);
+            assert!(!second.queue.lock().unwrap().shutdown);
+            assert!(!first.reporter_stop.load(Ordering::Relaxed));
+            assert!(!second.reporter_stop.load(Ordering::Relaxed));
+            {
+                let _nested = InternalThreadGuard::enter(&second);
+                assert_eq!(INTERNAL_MANAGER.with(Cell::get), Arc::as_ptr(&second));
+            }
+            assert_eq!(INTERNAL_MANAGER.with(Cell::get), Arc::as_ptr(&first));
+        }
+        assert!(INTERNAL_MANAGER.with(|current| current.get().is_null()));
+        assert_eq!(Arc::strong_count(&first), 2);
+        assert_eq!(Arc::strong_count(&second), 2);
+        assert_eq!(unsafe { dlmgr_shutdown_try(ptr::null_mut()) }, 0);
+    }
 
     /// dlmgr_set_priority：排队中任务提权后先被派发；同级保持原 seq（FIFO）；
     /// 重复改/未知 id 返回 false。
@@ -423,14 +550,35 @@ mod tests {
     fn set_priority_reorders_queue() {
         let sh = Arc::new(Shared::new(1, 0, 0, std::ptr::null_mut()));
         let mk = |id: u64| {
-            Arc::new(TaskShared::new(id, format!("t{id}"), "r".into(), String::new(), 1, 0, 0, 1))
+            Arc::new(TaskShared::new(
+                id,
+                format!("t{id}"),
+                "r".into(),
+                String::new(),
+                1,
+                0,
+                0,
+                1,
+            ))
         };
         {
             let mut q = sh.queue.lock().unwrap();
             // 入队顺序：低(1)、低(2)、高(3) —— 派发序应为 3、1、2
-            q.heap.push(HeapTask { priority: 0, seq: 0, task: mk(1) });
-            q.heap.push(HeapTask { priority: 0, seq: 1, task: mk(2) });
-            q.heap.push(HeapTask { priority: 5, seq: 2, task: mk(3) });
+            q.heap.push(HeapTask {
+                priority: 0,
+                seq: 0,
+                task: mk(1),
+            });
+            q.heap.push(HeapTask {
+                priority: 0,
+                seq: 1,
+                task: mk(2),
+            });
+            q.heap.push(HeapTask {
+                priority: 5,
+                seq: 2,
+                task: mk(3),
+            });
         }
 
         // 任务 1 提到最高：派发序变为 1、3、2

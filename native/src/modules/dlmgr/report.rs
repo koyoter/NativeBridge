@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::task::{
-    TASK_CANCELED, TASK_DONE, TASK_FAILED, TASK_RUNNING, TASK_VERIFYING, TaskShared,
+    TaskShared, TASK_CANCELED, TASK_DONE, TASK_FAILED, TASK_RUNNING, TASK_VERIFYING,
 };
 use super::Shared;
 
@@ -23,6 +23,7 @@ pub(crate) fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
 }
 
 fn reporter_loop(sh: Arc<Shared>) {
+    let _thread_guard = super::InternalThreadGuard::enter(&sh);
     // 每任务上次快照 (state, bytes_done)：状态或进度有变化才发逐任务回调，
     // 终态（Done/Failed/Canceled）在变化那一拍发出后不再重复刷屏。
     let mut prev: HashMap<u64, (i32, u64)> = HashMap::new();
@@ -63,7 +64,9 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
         let done = t.bytes_done.load(Ordering::Relaxed);
         let prev_done = prev.get(&t.id).map(|p| p.1).unwrap_or(0);
         delta += done.saturating_sub(prev_done);
-        let changed = prev.get(&t.id).map_or(true, |p| p.0 != state || p.1 != done);
+        let changed = prev
+            .get(&t.id)
+            .map_or(true, |p| p.0 != state || p.1 != done);
         // 退役规则：终态任务（Done/Failed/Canceled）首次上报即退役——终态计数
         // 与字节量并入全历史累计器（Canceled 不计成败），本拍不再计入 live 求和
         // （其贡献已由累计器承接，避免同拍双重计数），拍末从 tasks/prev 移除。
@@ -111,7 +114,17 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
         let bytes_done = sh.bytes_done_total.load(Ordering::Relaxed) + bytes_done;
         let bytes_total = sh.bytes_total_total.load(Ordering::Relaxed) + bytes_total;
         let gbps = (delta as f64 / dt) as u64;
-        unsafe { cb(user.0, active, done_cnt, failed_cnt, bytes_done, bytes_total, gbps) };
+        unsafe {
+            cb(
+                user.0,
+                active,
+                done_cnt,
+                failed_cnt,
+                bytes_done,
+                bytes_total,
+                gbps,
+            )
+        };
     }
     now
 }
@@ -122,13 +135,19 @@ mod tests {
     use libc::c_void;
     use std::sync::atomic::AtomicBool;
 
-    use super::super::SendPtr;
     use super::super::task::ERR_CANCELED;
+    use super::super::SendPtr;
 
     static REPORTED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "C" fn on_task(
-        _user: *mut c_void, _id: u64, state: i32, _done: u64, _total: u64, _bps: u64, _err: i32,
+        _user: *mut c_void,
+        _id: u64,
+        state: i32,
+        _done: u64,
+        _total: u64,
+        _bps: u64,
+        _err: i32,
     ) {
         if state == TASK_CANCELED {
             REPORTED.store(true, Ordering::SeqCst);
@@ -140,11 +159,23 @@ mod tests {
     #[test]
     fn final_pass_reports_terminal_after_stop() {
         let sh = Arc::new(Shared::new(1, 0, 0, std::ptr::null_mut()));
-        let t = Arc::new(TaskShared::new(7, "n".into(), "r".into(), String::new(), 1, 0, 0, 0));
+        let t = Arc::new(TaskShared::new(
+            7,
+            "n".into(),
+            "r".into(),
+            String::new(),
+            1,
+            0,
+            0,
+            0,
+        ));
         t.err.store(ERR_CANCELED, Ordering::Relaxed); // 先 err 后 state
         t.state.store(TASK_CANCELED, Ordering::Release);
         sh.tasks.lock().unwrap().insert(7, t);
-        *sh.task_cb.lock().unwrap() = Some((on_task as super::super::DlmgrTaskCb, SendPtr(std::ptr::null_mut())));
+        *sh.task_cb.lock().unwrap() = Some((
+            on_task as super::super::DlmgrTaskCb,
+            SendPtr(std::ptr::null_mut()),
+        ));
         sh.reporter_stop.store(true, Ordering::Release);
 
         // stop 已置位：while 不进循环，只剩最终补拍一拍

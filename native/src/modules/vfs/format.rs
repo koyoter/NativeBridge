@@ -33,7 +33,11 @@ pub(crate) const ST_BAD: u8 = 3;
 
 /// 4K 对齐（0 → 0）。
 pub(crate) fn align4k(n: u64) -> u64 {
-    n.div_ceil(ALIGN) * ALIGN
+    checked_align4k(n).expect("vfs: invalid aligned size")
+}
+
+pub(crate) fn checked_align4k(n: u64) -> Option<u64> {
+    n.div_ceil(ALIGN).checked_mul(ALIGN)
 }
 
 // --- Entry ---
@@ -133,7 +137,12 @@ pub(crate) struct RegionImage {
 }
 
 /// 从旧名字 blob 重建紧凑 StringArea 并序列化整个 region（就地修正 entries 的 name_off）。
-pub(crate) fn build_region(gen: u64, logical: u64, entries: &mut [Entry], old_blob: &[u8]) -> RegionImage {
+pub(crate) fn build_region(
+    gen: u64,
+    logical: u64,
+    entries: &mut [Entry],
+    old_blob: &[u8],
+) -> RegionImage {
     let mut blob = Vec::with_capacity(old_blob.len());
     for e in entries.iter_mut() {
         // 先取旧 blob 里的偏移再覆写 name_off：name_off 指向 old_blob，
@@ -180,7 +189,7 @@ pub(crate) struct SlotScan {
 }
 
 pub(crate) fn scan_slot(bytes: &[u8], off: usize) -> Option<SlotScan> {
-    if off + REGION_HDR_SIZE > bytes.len() {
+    if off.checked_add(REGION_HDR_SIZE)? > bytes.len() {
         return None;
     }
     let h = &bytes[off..off + REGION_HDR_SIZE];
@@ -193,15 +202,19 @@ pub(crate) fn scan_slot(bytes: &[u8], off: usize) -> Option<SlotScan> {
     if count > 1 << 24 || str_len > 1 << 30 {
         return None;
     }
-    let total = (REGION_HDR_SIZE + count * ENTRY_SIZE + str_len) as u64;
-    if off as u64 + total > bytes.len() as u64 {
+    let table_len = count.checked_mul(ENTRY_SIZE)?;
+    let total = REGION_HDR_SIZE
+        .checked_add(table_len)?
+        .checked_add(str_len)?;
+    let end = off.checked_add(total)?;
+    if end > bytes.len() {
         return None;
     }
     let body_off = off + REGION_HDR_SIZE;
-    let table = &bytes[body_off..body_off + count * ENTRY_SIZE];
-    let names = &bytes[body_off + count * ENTRY_SIZE..off + total as usize];
+    let table = &bytes[body_off..body_off + table_len];
+    let names = &bytes[body_off + table_len..end];
     let mut parsed = None;
-    if crc32(&bytes[body_off..off + total as usize]) == region_crc {
+    if crc32(&bytes[body_off..end]) == region_crc {
         let mut entries = Vec::with_capacity(count);
         let mut ok = true;
         for cell in table.chunks_exact(ENTRY_SIZE) {
@@ -221,16 +234,69 @@ pub(crate) fn scan_slot(bytes: &[u8], off: usize) -> Option<SlotScan> {
                 }
             }
         }
+        let mut extents = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let end = checked_align4k(e.size).and_then(|a| e.offset.checked_add(a));
+            match end {
+                Some(end) if e.offset % ALIGN == 0 && end <= logical => {
+                    if end > e.offset {
+                        extents.push((e.offset, end));
+                    }
+                }
+                _ => ok = false,
+            }
+        }
+        extents.sort_unstable();
+        if logical % ALIGN != 0 || extents.windows(2).any(|w| w[0].1 > w[1].0) {
+            ok = false;
+        }
         if ok {
-            parsed = Some(ParsedRegion { gen, logical, entries, names: names.to_vec() });
+            parsed = Some(ParsedRegion {
+                gen,
+                logical,
+                entries,
+                names: names.to_vec(),
+            });
         }
     }
-    Some(SlotScan { off: off as u64, total, parsed })
+    Some(SlotScan {
+        off: off as u64,
+        total: total as u64,
+        parsed,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_alignment_rejects_overflow() {
+        assert_eq!(checked_align4k(0), Some(0));
+        assert_eq!(checked_align4k(1), Some(4096));
+        assert_eq!(checked_align4k(u64::MAX - 4095), Some(u64::MAX - 4095));
+        assert_eq!(checked_align4k(u64::MAX - 4094), None);
+        assert_eq!(checked_align4k(u64::MAX), None);
+    }
+
+    #[test]
+    fn complete_slot_with_invalid_extent_is_not_parsed() {
+        for (offset, size, logical) in [(0, u64::MAX, 4096), (4096, 4096, 4096), (1, 1, 4096)] {
+            let mut entries = [Entry {
+                name_off: 0,
+                name_len: 1,
+                state: ST_ACTIVE,
+                offset,
+                size,
+                crc: 0,
+            }];
+            let img = build_region(1, logical, &mut entries, b"x\0");
+            let slot = scan_slot(&img.bytes, 0).unwrap();
+            assert_eq!(slot.total, img.bytes.len() as u64);
+            assert!(slot.parsed.is_none());
+        }
+        assert!(scan_slot(&[], usize::MAX).is_none());
+    }
 
     /// R04：重建紧凑 blob 必须先取旧偏移再覆写 name_off——
     /// 名字 blob 含死字节（abort/delete 残留）时，条目不得挂到错误名字下。
@@ -247,8 +313,22 @@ mod tests {
             b
         };
         let mut entries = vec![
-            Entry { name_off: 0, name_len: 3, state: ST_ACTIVE, offset: 0, size: 4, crc: 0 },
-            Entry { name_off: 8, name_len: 3, state: ST_ACTIVE, offset: 4096, size: 4, crc: 0 },
+            Entry {
+                name_off: 0,
+                name_len: 3,
+                state: ST_ACTIVE,
+                offset: 0,
+                size: 4,
+                crc: 0,
+            },
+            Entry {
+                name_off: 8,
+                name_len: 3,
+                state: ST_ACTIVE,
+                offset: 4096,
+                size: 4,
+                crc: 0,
+            },
         ];
         let img = build_region(1, 4096, &mut entries, &old_blob);
         let names = &img.bytes[img.blob_off..];

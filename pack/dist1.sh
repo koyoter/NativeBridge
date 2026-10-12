@@ -3,7 +3,7 @@
 # install_* artifacts produced by build.ps1.
 #
 # Usage (from repo root, after all platform build artifacts are present):
-#   bash pack/dist1.sh <version>
+#   bash pack/dist1.sh <version> [--require-all]
 #
 # Produces:
 #   NativeBridge/                     (Unity package tree, see below)
@@ -17,9 +17,17 @@
 #   install_android_*/nativebridge/lib/libNativeBridge.so
 #   install_osx_x64|arm64/nativebridge/lib/libNativeBridge.dylib
 #   install_ios_arm64/.../libNativeBridge.a  + sim + tvos  (xcframework)
-set -u
+set -euo pipefail
 
 VERSION="${1:-1.0.0}"
+REQUIRE_ALL=false
+if [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "$2" != '--require-all' ]; }; then
+    echo 'Usage: bash pack/dist1.sh <version> [--require-all]' >&2
+    exit 1
+fi
+if [ "${2:-}" = '--require-all' ]; then
+    REQUIRE_ALL=true
+fi
 LIB=nativebridge
 PKG=NativeBridge
 OUT="$PKG"
@@ -27,14 +35,55 @@ ZIP="${PKG}-${VERSION}.zip"
 
 echo "NativeBridge dist: version=$VERSION"
 
+# Check required inputs and tools before removing an existing package tree.
+require_file() {
+    if [ ! -f "$1" ]; then
+        echo "ERROR: required input missing: $1" >&2
+        exit 1
+    fi
+}
+require_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: required tool unavailable: $1" >&2
+        exit 1
+    fi
+}
+require_tool zip
+for source in Curlw.cs Vfs.cs DownloadManager.cs NativeBridgeF.asmdef; do
+    require_file "csharp/NativeBridge/$source"
+done
+if "$REQUIRE_ALL"; then
+    for arch in x64 arm64; do
+        require_file "install_win32_${arch}/$LIB/bin/NativeBridge.dll"
+        require_file "install_linux_${arch}/$LIB/lib/libNativeBridge.so"
+        require_file "install_osx_${arch}/$LIB/lib/libNativeBridge.dylib"
+    done
+    for arch in armv7 arm64 x86 x64; do
+        require_file "install_android_${arch}/$LIB/lib/libNativeBridge.so"
+    done
+    for plat in ios tvos; do
+        for arch in arm64 arm64_sim x64; do
+            require_file "install_${plat}_${arch}/$LIB/lib/libNativeBridge.a"
+        done
+    done
+    require_tool xcodebuild
+    require_tool lipo
+fi
+MAC_X64="install_osx_x64/$LIB/lib/libNativeBridge.dylib"
+MAC_ARM="install_osx_arm64/$LIB/lib/libNativeBridge.dylib"
+MAC_CPU=AnyCPU
+if [ -f "$MAC_X64" ] && [ -f "$MAC_ARM" ]; then
+    require_tool lipo
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT/Runtime" "$OUT/Plugins"
 
 # --- C# runtime sources -----------------------------------------------------
-cp -f csharp/NativeBridge/Curlw.cs "$OUT/Runtime/" 2>/dev/null || echo "WARN: Curlw.cs missing"
-cp -f csharp/NativeBridge/Vfs.cs "$OUT/Runtime/" 2>/dev/null || echo "WARN: Vfs.cs missing"
-cp -f csharp/NativeBridge/DownloadManager.cs "$OUT/Runtime/" 2>/dev/null || echo "WARN: DownloadManager.cs missing"
-cp -f csharp/NativeBridge/NativeBridgeF.asmdef "$OUT/Runtime/" 2>/dev/null || echo "WARN: NativeBridgeF.asmdef missing"
+cp -f csharp/NativeBridge/Curlw.cs "$OUT/Runtime/"
+cp -f csharp/NativeBridge/Vfs.cs "$OUT/Runtime/"
+cp -f csharp/NativeBridge/DownloadManager.cs "$OUT/Runtime/"
+cp -f csharp/NativeBridge/NativeBridgeF.asmdef "$OUT/Runtime/"
 
 # --- helper: copy a file if it exists, else warn ---------------------------
 copy_if() { # src dstdir
@@ -62,16 +111,19 @@ copy_if "install_android_x64/$LIB/lib/libNativeBridge.so"   "$OUT/Plugins/Androi
 copy_if "install_android_x86/$LIB/lib/libNativeBridge.so"   "$OUT/Plugins/Android/x86"
 
 # --- macOS (universal .bundle-less dylib) -----------------------------------
-MAC_X64="install_osx_x64/$LIB/lib/libNativeBridge.dylib"
-MAC_ARM="install_osx_arm64/$LIB/lib/libNativeBridge.dylib"
-if [ -f "$MAC_X64" ] && [ -f "$MAC_ARM" ] && command -v lipo >/dev/null 2>&1; then
+if [ -f "$MAC_X64" ] && [ -f "$MAC_ARM" ]; then
     mkdir -p "$OUT/Plugins/macOS"
     lipo -create "$MAC_X64" "$MAC_ARM" -output "$OUT/Plugins/macOS/NativeBridge.dylib"
     lipo -info "$OUT/Plugins/macOS/NativeBridge.dylib"
     echo "  + macOS universal dylib"
-else
+elif [ -f "$MAC_ARM" ]; then
+    MAC_CPU=ARM64
     copy_if "$MAC_ARM" "$OUT/Plugins/macOS"
+elif [ -f "$MAC_X64" ]; then
+    MAC_CPU=x86_64
     copy_if "$MAC_X64" "$OUT/Plugins/macOS"
+else
+    echo '  - skip macOS (no dylibs found)'
 fi
 
 # --- iOS / tvOS xcframeworks (static libs) ----------------------------------
@@ -97,11 +149,19 @@ build_xcframework() {
     rm -rf "$tmp"; mkdir -p "$tmp"
 
     # device slice
-    [ -f "$dev" ] && args+=(-library "$dev")
+    if [ -f "$dev" ]; then
+        args+=(-library "$dev")
+    fi
 
     # simulator slice (arm64 + x64 -> fat)
     if [ -f "$sim_arm" ] || [ -f "$sim_x64" ]; then
-        local inputs=(); [ -f "$sim_arm" ] && inputs+=("$sim_arm"); [ -f "$sim_x64" ] && inputs+=("$sim_x64")
+        local inputs=()
+        if [ -f "$sim_arm" ]; then
+            inputs+=("$sim_arm")
+        fi
+        if [ -f "$sim_x64" ]; then
+            inputs+=("$sim_x64")
+        fi
         lipo -create "${inputs[@]}" -output "$tmp/${plat}_sim.a"
         args+=(-library "$tmp/${plat}_sim.a")
     fi
@@ -125,7 +185,11 @@ build_xcframework tvos tvOS
     echo "nativebridge: $VERSION"
     echo "curlw_abi: 1"
     for verf in install_*/curl/_1kiss; do
-        [ -f "$verf" ] && echo "curl: $(head -1 "$verf" | sed 's/^ver:[[:space:]]*//')" && break
+        if [ -f "$verf" ]; then
+            curl_version=$(sed -n '1s/^ver:[[:space:]]*//p' "$verf")
+            echo "curl: $curl_version"
+            break
+        fi
     done
 } > "$OUT/_nativebridge.yml"
 
@@ -192,7 +256,7 @@ META_TEXT='TextScriptImporter:
   assetBundleName: 
   assetBundleVariant:'
 
-plugin_meta() { # dst guid spec...  spec = first-key|first-value|cpu (cpu may be empty)
+plugin_meta() { # dst guid spec...  spec = first-key|first-value|cpu[|editor-os]
     # Unity parses each `first` map as platform-name -> platform-name pairs
     # (`Editor: Editor`, `Standalone: Win64`); `Any:` is the lone empty-value
     # entry. Names and CPU values must be Unity's exact serialized form — one
@@ -209,16 +273,26 @@ plugin_meta() { # dst guid spec...  spec = first-key|first-value|cpu (cpu may be
         printf '  isPreloaded: 0\n  isOverridable: 0\n  isExplicitlyReferenced: 0\n  validateReferences: 1\n'
         printf '  platformData:\n'
         printf '  - first:\n      Any: \n    second:\n      enabled: 0\n      settings: {}\n'
-        local spec key rest val cpu
+        local spec key rest val cpu os
         for spec in "$@"; do
             key="${spec%%|*}"
             rest="${spec#*|}"
             val="${rest%%|*}"
-            cpu="${rest#*|}"
-            [ "$cpu" = "$rest" ] && cpu=''
+            rest="${rest#*|}"
+            cpu="${rest%%|*}"
+            os=''
+            if [[ "$rest" == *'|'* ]]; then
+                os="${rest#*|}"
+            fi
             printf '  - first:\n      %s: %s\n    second:\n      enabled: 1\n' "$key" "$val"
-            if [ -n "$cpu" ]; then
-                printf '      settings:\n        CPU: %s\n' "$cpu"
+            if [ -n "$cpu" ] || [ -n "$os" ]; then
+                printf '      settings:\n'
+                if [ -n "$cpu" ]; then
+                    printf '        CPU: %s\n' "$cpu"
+                fi
+                if [ -n "$os" ]; then
+                    printf '        OS: %s\n' "$os"
+                fi
             else
                 printf '      settings: {}\n'
             fi
@@ -251,12 +325,15 @@ gen_meta() { # absolute path under $OUT
             # editor (x64 Windows/Linux editors, macOS universal). Absent
             # platforms stay disabled via the Any:0 entry.
             case "$rel" in
-                Plugins/Windows/x86_64/*)     plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64' 'Standalone|Win64|x86_64' ;;
+                Plugins/Windows/x86_64/*)     plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64|Windows' 'Standalone|Win64|x86_64' ;;
                 Plugins/Windows/ARM64/*)      plugin_meta "$p.meta" "$guid" 'Standalone|Win64|ARM64' ;;
-                Plugins/Linux/x86_64/*)       plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64' 'Standalone|Linux64|x86_64' ;;
+                Plugins/Linux/x86_64/*)       plugin_meta "$p.meta" "$guid" 'Editor|Editor|x86_64|Linux' 'Standalone|Linux64|x86_64' ;;
                 Plugins/Linux/ARM64/*)        plugin_meta "$p.meta" "$guid" 'Standalone|Linux64|ARM64' ;;
-                Plugins/Android/*)            plugin_meta "$p.meta" "$guid" 'Android|Android|' ;;
-                Plugins/macOS/*)              plugin_meta "$p.meta" "$guid" 'Editor|Editor|AnyCPU' 'Standalone|OSXUniversal|AnyCPU' ;;
+                Plugins/Android/armeabi-v7a/*) plugin_meta "$p.meta" "$guid" 'Android|Android|ARMv7' ;;
+                Plugins/Android/arm64-v8a/*)   plugin_meta "$p.meta" "$guid" 'Android|Android|ARM64' ;;
+                Plugins/Android/x86/*)        plugin_meta "$p.meta" "$guid" 'Android|Android|x86' ;;
+                Plugins/Android/x86_64/*)      plugin_meta "$p.meta" "$guid" 'Android|Android|x86_64' ;;
+                Plugins/macOS/*)              plugin_meta "$p.meta" "$guid" "Editor|Editor|$MAC_CPU|OSX" "Standalone|OSXUniversal|$MAC_CPU" ;;
                 Plugins/iOS/*)                plugin_meta "$p.meta" "$guid" 'iPhone|iPhone|' ;;
                 Plugins/tvOS/*)               plugin_meta "$p.meta" "$guid" 'tvOS|tvOS|' ;;
                 *)
@@ -267,18 +344,19 @@ gen_meta() { # absolute path under $OUT
     esac
 }
 
+meta_listing=$(mktemp)
+trap 'rm -f "$meta_listing"' EXIT
+find "$OUT" -mindepth 1 \( -name '*.xcframework' -prune -print0 \) -o -print0 > "$meta_listing"
 while IFS= read -r -d '' p; do
     gen_meta "$p"
-done < <(find "$OUT" -mindepth 1 \( -name '*.xcframework' -prune -print0 \) -o -print0)
+done < "$meta_listing"
+rm -f "$meta_listing"
+trap - EXIT
 
 # --- zip --------------------------------------------------------------------
 rm -f "$ZIP"
-if command -v zip >/dev/null 2>&1; then
-    zip -q -r "$ZIP" "$OUT"
-    echo "NativeBridge dist: wrote $ZIP"
-else
-    echo "WARN: zip not found; package tree left at $OUT/"
-fi
+zip -q -r "$ZIP" "$OUT"
+echo "NativeBridge dist: wrote $ZIP"
 
 # Export for the GitHub release step.
 if [ -n "${GITHUB_ENV:-}" ]; then

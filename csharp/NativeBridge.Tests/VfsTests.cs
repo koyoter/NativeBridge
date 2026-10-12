@@ -61,6 +61,205 @@ namespace NativeBridgeF.Tests
         // --- tests -----------------------------------------------------------------
 
         /// <summary>
+        /// 回归：追加 region 写入中断后，下一次成功 flush 仍必须可恢复。
+        /// </summary>
+        [Test]
+        public void Flush_AfterTruncatedRegion_PreservesLaterCommit()
+        {
+            byte[] first = TestPaths.Content(4096, 1);
+            byte[] second = TestPaths.Content(4096, 2);
+            string indexPath = Path.Combine(_dir, "header.vfs");
+            string dataPath = Path.Combine(_dir, "files.vfs");
+
+            IntPtr h = OpenRaw(_dir);
+            try
+            {
+                NativeWrite(h, "first.bin", first);
+                Assert.That(VfsDLL.vfs_flush(h), Is.EqualTo((int)VfsResult.OK));
+            }
+            finally { VfsDLL.vfs_close(h); }
+
+            using (var stream = new FileStream(indexPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            {
+                stream.WriteByte(0x7f); // incomplete 32-byte region header
+            }
+
+            IntPtr h2 = OpenRaw(_dir);
+            try
+            {
+                NativeWrite(h2, "second.bin", second);
+                Assert.That(VfsDLL.vfs_flush(h2), Is.EqualTo((int)VfsResult.OK));
+            }
+            finally { VfsDLL.vfs_close(h2); }
+
+            using (var reader = VfsReader.Open(indexPath, dataPath))
+            {
+                reader.RefreshIndex();
+                reader.EnsureMapping();
+                Assert.That(reader.TryReadBytes("first.bin", out byte[] gotFirst), Is.True);
+                Assert.That(gotFirst, Is.EqualTo(first));
+                Assert.That(reader.TryReadBytes("second.bin", out byte[] gotSecond), Is.True);
+                Assert.That(gotSecond, Is.EqualTo(second));
+            }
+        }
+
+        /// <summary>
+        /// 回归：已有但不可恢复的索引必须报错，不能初始化并覆盖原文件。
+        /// </summary>
+        [Test]
+        public void Open_InvalidExistingIndex_DoesNotResetFiles()
+        {
+            string indexPath = Path.Combine(_dir, "header.vfs");
+            string dataPath = Path.Combine(_dir, "files.vfs");
+            byte[] indexSentinel = Encoding.ASCII.GetBytes("not-a-vfs-index");
+            byte[] dataSentinel = TestPaths.Content(32, 91);
+            File.WriteAllBytes(indexPath, indexSentinel);
+            File.WriteAllBytes(dataPath, dataSentinel);
+
+            IntPtr h = VfsDLL.vfs_open_paths(DlmgrDLL.Utf8Bytes(indexPath), DlmgrDLL.Utf8Bytes(dataPath));
+            if (h != IntPtr.Zero) VfsDLL.vfs_close(h);
+            Assert.Multiple(() =>
+            {
+                Assert.That(h, Is.EqualTo(IntPtr.Zero), "已有坏索引必须拒绝打开");
+                Assert.That(File.ReadAllBytes(indexPath), Is.EqualTo(indexSentinel), "索引不得被重置");
+                Assert.That(File.ReadAllBytes(dataPath), Is.EqualTo(dataSentinel), "数据不得被改写");
+            });
+        }
+
+        /// <summary>
+        /// 回归：长度对齐溢出必须在登记 writer 前拒绝。
+        /// </summary>
+        [Test]
+        public void Alloc_MaxValueSize_IsRejected()
+        {
+            IntPtr h = OpenRaw(_dir);
+            try
+            {
+                IntPtr writer = VfsDLL.vfs_alloc(h, DlmgrDLL.Utf8Bytes("overflow.bin"), ulong.MaxValue);
+                try
+                {
+                    Assert.That(writer, Is.EqualTo(IntPtr.Zero));
+                }
+                finally
+                {
+                    if (writer != IntPtr.Zero) VfsDLL.vfs_writer_abort(writer);
+                }
+            }
+            finally { VfsDLL.vfs_close(h); }
+        }
+
+        [Test]
+        public void Compact_ReserveOverflow_IsRejectedWithoutTruncatingData()
+        {
+            byte[] data = TestPaths.Content(4096, 17);
+            IntPtr h = OpenRaw(_dir);
+            int err;
+            try
+            {
+                NativeWrite(h, "keeper.bin", data);
+                Assert.That(VfsDLL.vfs_flush(h), Is.EqualTo((int)VfsResult.OK));
+                CompactDone.Reset();
+                s_compactErr = int.MinValue;
+                err = VfsDLL.vfs_compact(h, ulong.MaxValue, null, CompactDoneCallback, IntPtr.Zero);
+                if (err == (int)VfsResult.OK)
+                {
+                    Assert.That(CompactDone.Wait(60_000), Is.True, "整理回调超时");
+                    err = s_compactErr;
+                }
+            }
+            finally { VfsDLL.vfs_close(h); }
+            Assert.Multiple(() =>
+            {
+                Assert.That(err, Is.EqualTo((int)VfsResult.InvalidArg), "无法表示的预留容量必须拒绝");
+                Assert.That(File.ReadAllBytes(Path.Combine(_dir, "files.vfs")), Is.EqualTo(data),
+                    "拒绝溢出请求时不能截断已提交数据");
+            });
+        }
+
+        [Test]
+        public void WriterWrite_NullArray_ThrowsArgumentNullException()
+        {
+            Assert.Throws<ArgumentNullException>(() =>
+                VfsDLL.vfs_writer_write(IntPtr.Zero, 0, null, 0, 0));
+        }
+
+        [TestCase(-1, 1)]
+        [TestCase(0, -1)]
+        [TestCase(2, 0)]
+        [TestCase(1, 1)]
+        [TestCase(0, 2)]
+        [TestCase(1, int.MaxValue)]
+        public void WriterWrite_InvalidArrayRange_ThrowsArgumentException(int offset, int count)
+        {
+            // 空 writer 让缺失的托管检查安全报红，不执行实际 native 越界读。
+            Assert.That(() => VfsDLL.vfs_writer_write(IntPtr.Zero, 0, new byte[1], offset, count),
+                Throws.InstanceOf<ArgumentException>());
+        }
+
+        [TestCase(0)]
+        [TestCase(1)]
+        public void WriterWrite_EmptyRangeAtArrayEnd_Succeeds(int length)
+        {
+            IntPtr h = OpenRaw(_dir);
+            try
+            {
+                IntPtr writer = VfsDLL.vfs_alloc(h, DlmgrDLL.Utf8Bytes("empty.bin"), 0);
+                Assert.That(writer, Is.Not.EqualTo(IntPtr.Zero));
+                try
+                {
+                    Assert.That(VfsDLL.vfs_writer_write(writer, 0, new byte[length], length, 0),
+                        Is.EqualTo((int)VfsResult.OK));
+                }
+                finally { VfsDLL.vfs_writer_abort(writer); }
+            }
+            finally { VfsDLL.vfs_close(h); }
+        }
+
+        /// <summary>
+        /// 回归：小于下一文件大小的空洞也必须在本轮整理后收敛掉。
+        /// </summary>
+        [Test]
+        public void Compact_SmallGap_ConvergesToDenseLayout()
+        {
+            byte[] first = TestPaths.Content(4096, 1);
+            byte[] deleted = TestPaths.Content(8192, 2);
+            byte[] last = TestPaths.Content(12288, 3);
+            IntPtr h = OpenRaw(_dir);
+            try
+            {
+                NativeWrite(h, "first.bin", first);
+                NativeWrite(h, "deleted.bin", deleted);
+                NativeWrite(h, "last.bin", last);
+            }
+            finally { VfsDLL.vfs_close(h); }
+
+            using (var reader = VfsReader.Open(_dir))
+            {
+                reader.RefreshIndex();
+                reader.Delete("deleted.bin");
+                reader.Flush();
+                reader.ReleaseMapping();
+                CompactDone.Reset();
+                s_compactErr = int.MinValue;
+                reader.Compact(0, null, CompactDoneCallback, IntPtr.Zero);
+                Assert.That(CompactDone.Wait(60_000), Is.True);
+                Assert.That(s_compactErr, Is.EqualTo((int)VfsResult.OK));
+                reader.RefreshIndex();
+                reader.EnsureMapping();
+
+                Assert.That(reader.TryGet("first.bin", out VfsEntry firstEntry), Is.True);
+                Assert.That(reader.TryGet("last.bin", out VfsEntry lastEntry), Is.True);
+                Assert.That(firstEntry.Offset, Is.EqualTo(0UL));
+                Assert.That(lastEntry.Offset, Is.EqualTo(4096UL));
+                Assert.That(reader.TryReadBytes("first.bin", out byte[] gotFirst), Is.True);
+                Assert.That(reader.TryReadBytes("last.bin", out byte[] gotLast), Is.True);
+                Assert.That(gotFirst, Is.EqualTo(first));
+                Assert.That(gotLast, Is.EqualTo(last));
+                Assert.That(reader.Stat().Logical, Is.EqualTo(4096UL + 12288UL));
+            }
+        }
+
+        /// <summary>
         /// 测试重点：目录式打开会创建 header.vfs/files.vfs 文件对，ABI 版本守卫恒为 1。
         /// 验证容器初始化与 C#/native 版本契约。
         /// </summary>
@@ -407,6 +606,7 @@ namespace NativeBridgeF.Tests
 
         // 压实回调必须是 static 委托（IL2CPP/AOT 纪律；本测试类生命周期内保活）
         private static readonly ManualResetEventSlim CompactDone = new ManualResetEventSlim(false);
+        private static readonly VfsDoneDelegate CompactDoneCallback = OnCompactDone;
         private static int s_compactErr = int.MinValue;
 
         private static void OnCompactDone(IntPtr user, int err)

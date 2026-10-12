@@ -25,12 +25,15 @@ use std::sync::Arc;
 use libc::{c_char, c_int, c_void};
 
 use super::format::{self, Entry, ST_ACTIVE, ST_BAD};
-use super::{ioerr, VfsError, VfsShared, COMPACT_FINALIZE, COMPACT_IDLE, COMPACT_MOVE, COMPACT_SCAN};
+use super::{
+    ioerr, VfsError, VfsShared, COMPACT_FINALIZE, COMPACT_IDLE, COMPACT_MOVE, COMPACT_SCAN,
+};
 
 /// Move 分块大小（~4MB）。
 const CHUNK: usize = 4 << 20;
 
-pub(crate) type ProgressCb = unsafe extern "C" fn(user: *mut c_void, percent: c_int, name: *const c_char);
+pub(crate) type ProgressCb =
+    unsafe extern "C" fn(user: *mut c_void, percent: c_int, name: *const c_char);
 pub(crate) type DoneCb = unsafe extern "C" fn(user: *mut c_void, err: c_int);
 
 pub(crate) struct PlanItem {
@@ -47,13 +50,36 @@ pub(crate) struct Plan {
     pub(crate) new_logical: u64,
     /// 需要实际搬移的字节数（进度分母）。
     pub(crate) copy_total: u64,
-    /// 有 case-A 因命中已搬源区被排挤到末尾 → 本轮留下下一轮可回收的洞。
+    /// 任一条目搬到末尾 → 本轮留下下一轮可回收的洞。
     pub(crate) excluded_any: bool,
 }
 
 /// Scan：Active 条目按 §1.1-5 分配新 offset。纯函数，便于单测。
-pub(crate) fn build_plan(mut actives: Vec<(String, Entry)>, old_logical: u64) -> Plan {
+pub(crate) fn build_plan(
+    mut actives: Vec<(String, Entry)>,
+    old_logical: u64,
+) -> Result<Plan, VfsError> {
+    if old_logical % format::ALIGN != 0 {
+        return Err(VfsError::InvalidArg);
+    }
     actives.sort_by_key(|(_, e)| e.offset);
+    let mut source_end = 0;
+    for (_, e) in &actives {
+        let aligned = format::checked_align4k(e.size).ok_or(VfsError::WriteOverflow)?;
+        let end = e
+            .offset
+            .checked_add(aligned)
+            .ok_or(VfsError::WriteOverflow)?;
+        if e.offset % format::ALIGN != 0
+            || end > old_logical
+            || (aligned != 0 && e.offset < source_end)
+        {
+            return Err(VfsError::InvalidArg);
+        }
+        if aligned != 0 {
+            source_end = end;
+        }
+    }
     let mut cursor = 0u64;
     let mut data_end = old_logical;
     let mut new_logical = 0u64;
@@ -63,34 +89,53 @@ pub(crate) fn build_plan(mut actives: Vec<(String, Entry)>, old_logical: u64) ->
     let mut moved_sources: Vec<(u64, u64)> = Vec::new();
     let mut excluded_any = false;
     for (name, e) in actives {
-        let a = format::align4k(e.size);
+        let a = format::checked_align4k(e.size).ok_or(VfsError::WriteOverflow)?;
+        let cursor_end = cursor.checked_add(a).ok_or(VfsError::WriteOverflow)?;
         let target = if e.offset == cursor {
-            cursor += a;
+            cursor = cursor_end;
             e.offset
         } else {
-            // 候选 [cursor, cursor+a) 与任一已搬源区相交 → 排挤到末尾
-            let hits_moved = moved_sources.iter().any(|&(s, t)| cursor < t && s < cursor + a);
-            if !hits_moved && e.offset - cursor >= a {
+            // Candidate destinations must not overwrite an earlier moved source.
+            let hits_moved = moved_sources
+                .iter()
+                .any(|&(s, t)| cursor < t && s < cursor_end);
+            if !hits_moved && e.offset.checked_sub(cursor).is_some_and(|gap| gap >= a) {
                 let t = cursor;
-                cursor += a;
+                cursor = cursor_end;
                 t
             } else {
-                if hits_moved {
-                    excluded_any = true;
-                }
+                excluded_any = true;
                 let t = data_end;
-                data_end += a;
+                data_end = data_end.checked_add(a).ok_or(VfsError::WriteOverflow)?;
                 t
             }
         };
         if target != e.offset {
-            moved_sources.push((e.offset, e.offset + a));
+            moved_sources.push((
+                e.offset,
+                e.offset.checked_add(a).ok_or(VfsError::WriteOverflow)?,
+            ));
         }
-        new_logical = new_logical.max(target + a);
-        items.push(PlanItem { name, old_off: e.offset, new_off: target, size: e.size, crc: e.crc });
+        new_logical = new_logical.max(target.checked_add(a).ok_or(VfsError::WriteOverflow)?);
+        items.push(PlanItem {
+            name,
+            old_off: e.offset,
+            new_off: target,
+            size: e.size,
+            crc: e.crc,
+        });
     }
-    let copy_total = items.iter().filter(|i| i.new_off != i.old_off).map(|i| i.size).sum();
-    Plan { items, new_logical, copy_total, excluded_any }
+    let copy_total = items
+        .iter()
+        .filter(|i| i.new_off != i.old_off)
+        .try_fold(0u64, |total, i| total.checked_add(i.size))
+        .ok_or(VfsError::WriteOverflow)?;
+    Ok(Plan {
+        items,
+        new_logical,
+        copy_total,
+        excluded_any,
+    })
 }
 
 /// 由 Vfs::compact 在持有 inner 锁、置位 compacting 之后调用。
@@ -109,7 +154,13 @@ pub(crate) fn start(
     spawned.map(|_| ()).map_err(ioerr)
 }
 
-fn run(shared: Arc<VfsShared>, reserve_extra: u64, progress: Option<ProgressCb>, done: Option<DoneCb>, user: usize) {
+fn run(
+    shared: Arc<VfsShared>,
+    reserve_extra: u64,
+    progress: Option<ProgressCb>,
+    done: Option<DoneCb>,
+    user: usize,
+) {
     let code = match compact_run(&shared, reserve_extra, progress, user) {
         Ok(()) => 0,
         Err(e) => e.as_i32(),
@@ -124,11 +175,15 @@ fn run(shared: Arc<VfsShared>, reserve_extra: u64, progress: Option<ProgressCb>,
     }
 }
 
-fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<ProgressCb>, user: usize) -> Result<(), VfsError> {
+fn compact_run(
+    shared: &VfsShared,
+    reserve_extra: u64,
+    progress: Option<ProgressCb>,
+    user: usize,
+) -> Result<(), VfsError> {
     // Move 前把当前索引（含未 flush 的 delete）落盘：磁盘 header 与内存一致后，
     // Move 覆盖"已删/垃圾"区才不破坏旧 header 下的 Active 源数据（崩溃安全前提）。
-    super::flush_image(shared)?;
-    for _ in 0..8 {
+    for round in 0..8 {
         // --- Scan ---
         shared.ctl.state.store(COMPACT_SCAN, Ordering::Relaxed);
         let (plan, old_gen) = {
@@ -140,8 +195,14 @@ fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<Progress
                 .filter(|e| e.state == ST_ACTIVE)
                 .map(|e| (g.idx.name_of(e).unwrap_or("").to_string(), *e))
                 .collect();
-            (build_plan(actives, g.idx.logical), g.idx.generation)
+            (build_plan(actives, g.idx.logical)?, g.idx.generation)
         };
+        plan.new_logical
+            .checked_add(reserve_extra)
+            .ok_or(VfsError::InvalidArg)?;
+        if round == 0 {
+            super::flush_image(shared)?;
+        }
 
         // --- Move ---
         shared.ctl.state.store(COMPACT_MOVE, Ordering::Relaxed);
@@ -162,11 +223,15 @@ fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<Progress
             match copy_verified(&rd, if moved { Some(&wr) } else { None }, item, &mut buf) {
                 Ok(true) => {}
                 Ok(false) => bad.push(item.name.clone()), // crc 不符 → 标 Bad，Finalize 剔除
-                Err(e) => return Err(e),                   // IO 错误 → 放弃整理，旧 header 恒成立
+                Err(e) => return Err(e),                  // IO 错误 → 放弃整理，旧 header 恒成立
             }
             if moved {
                 copied += item.size;
-                let pct = if plan.copy_total == 0 { 100 } else { (copied * 100 / plan.copy_total).min(100) };
+                let pct = if plan.copy_total == 0 {
+                    100
+                } else {
+                    (copied as u128 * 100 / plan.copy_total as u128).min(100)
+                };
                 shared.ctl.percent.store(pct as u32, Ordering::Relaxed);
                 fire_progress(progress, user, pct as c_int, &item.name);
             }
@@ -201,12 +266,23 @@ fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<Progress
             blob.extend_from_slice(i.name.as_bytes());
             blob.push(0);
         }
-        let new_logical = entries.iter().map(|e| e.offset + format::align4k(e.size)).max().unwrap_or(0);
+        let mut new_logical = 0u64;
+        for e in &entries {
+            let aligned = format::checked_align4k(e.size).ok_or(VfsError::WriteOverflow)?;
+            let end = e
+                .offset
+                .checked_add(aligned)
+                .ok_or(VfsError::WriteOverflow)?;
+            new_logical = new_logical.max(end);
+        }
+        let final_size = new_logical
+            .checked_add(reserve_extra)
+            .ok_or(VfsError::InvalidArg)?;
         // 数据先行落盘（§2.3 顺序：fsync files.vfs → 一次性翻转 → 截断/预扩容）。
         if wr.sync_all().is_err() {
             return Err(VfsError::Io);
         }
-        let new_gen = old_gen + 1;
+        let new_gen = old_gen.checked_add(1).ok_or(VfsError::WriteOverflow)?;
         let img = format::build_region(new_gen, new_logical, &mut entries, &blob);
         // 整理的 gen = 扫描时最高 gen + 1，不会命中水位线 GenChanged；任何错误按 Io 上报。
         if shared.persist_image(new_gen, &img.bytes).is_err() {
@@ -214,7 +290,7 @@ fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<Progress
         }
         // 翻转成功后截垃圾+预扩容；失败无害（open 对逻辑外残留忽略 / 物理不足补齐），
         // 不因 set_len 失败把已完成的整理回报为失败。
-        let _ = wr.set_len(new_logical + reserve_extra);
+        let _ = wr.set_len(final_size);
         // 翻转成功 → 换内存索引（generation 一并递增）。
         let names = img.bytes[img.blob_off..].to_vec();
         {
@@ -232,7 +308,12 @@ fn compact_run(shared: &VfsShared, reserve_extra: u64, progress: Option<Progress
 
 /// 分块读并累计 crc32（wr = Some 时边读边写 = 搬移；None = 仅读校验原地条目）。
 /// Ok(false) = 源数据 crc 不符（坏块）。
-fn copy_verified(rd: &File, wr: Option<&File>, item: &PlanItem, buf: &mut [u8]) -> Result<bool, VfsError> {
+fn copy_verified(
+    rd: &File,
+    wr: Option<&File>,
+    item: &PlanItem,
+    buf: &mut [u8],
+) -> Result<bool, VfsError> {
     let mut raw = 0xFFFF_FFFFu32;
     let mut done = 0u64;
     while done < item.size {
@@ -245,6 +326,48 @@ fn copy_verified(rd: &File, wr: Option<&File>, item: &PlanItem, buf: &mut [u8]) 
         done += n as u64;
     }
     Ok(!raw == item.crc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_rejects_invalid_extents_and_overflow() {
+        let e = |offset, size| Entry {
+            name_off: 0,
+            name_len: 0,
+            state: ST_ACTIVE,
+            offset,
+            size,
+            crc: 0,
+        };
+        assert!(matches!(
+            build_plan(vec![("x".into(), e(0, u64::MAX))], 4096),
+            Err(VfsError::WriteOverflow)
+        ));
+        assert!(matches!(
+            build_plan(vec![("x".into(), e(4096, 4096))], 4096),
+            Err(VfsError::InvalidArg)
+        ));
+        assert!(matches!(
+            build_plan(vec![("x".into(), e(1, 1))], 4096),
+            Err(VfsError::InvalidArg)
+        ));
+        assert!(matches!(
+            build_plan(
+                vec![("x".into(), e(0, 8192)), ("y".into(), e(4096, 4096))],
+                8192
+            ),
+            Err(VfsError::InvalidArg)
+        ));
+        let logical = u64::MAX - 4095;
+        assert!(matches!(
+            build_plan(vec![("x".into(), e(4096, 8192))], logical),
+            Err(VfsError::WriteOverflow)
+        ));
+        assert!(build_plan(Vec::new(), 1).is_err());
+    }
 }
 
 fn fire_progress(progress: Option<ProgressCb>, user: usize, percent: c_int, name: &str) {

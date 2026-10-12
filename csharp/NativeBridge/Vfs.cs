@@ -161,6 +161,13 @@ namespace NativeBridgeF
         /// <summary>Sequential write into the writer's window (cdecl, byte[] pinned for the call).</summary>
         public static unsafe int vfs_writer_write(IntPtr w, ulong rel_off, byte[] data, int offset, int count)
         {
+            if (data == null) throw new ArgumentNullException("data");
+            if (offset < 0 || offset > data.Length) throw new ArgumentOutOfRangeException("offset");
+            if (count < 0 || count > data.Length - offset) throw new ArgumentOutOfRangeException("count");
+            if (count == 0)
+            {
+                return vfs_writer_write_imp(w, rel_off, IntPtr.Zero, UIntPtr.Zero);
+            }
             fixed (byte* p = &data[offset])
             {
                 return vfs_writer_write_imp(w, rel_off, (IntPtr)p, (UIntPtr)count);
@@ -252,6 +259,20 @@ namespace NativeBridgeF
 
         public string IndexFilePath { get { return _indexPath; } }
         public string DataFilePath { get { return _dataPath; } }
+
+        /// <summary>
+        /// Borrowed native VFS handle for APIs that require it. Do not close this
+        /// handle; VfsReader owns it and closes it on Dispose. The reader must
+        /// remain alive for the entire lifetime of any native writer/sink using it.
+        /// </summary>
+        public IntPtr NativeHandle
+        {
+            get
+            {
+                if (_h == IntPtr.Zero) throw new ObjectDisposedException(nameof(VfsReader));
+                return _h;
+            }
+        }
 
         private VfsReader(IntPtr handle, string indexPath, string dataPath)
         {

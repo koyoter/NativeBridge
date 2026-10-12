@@ -25,12 +25,12 @@ use std::sync::{Arc, Mutex};
 
 use libc::{c_char, c_int, c_void};
 
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 #[cfg(not(windows))]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
-use format::{Entry, SlotScan, ST_ACTIVE, ST_DELETED, ST_DOWNLOADING, SB_GEN_OFF, SB_SIZE};
+use format::{Entry, SlotScan, SB_GEN_OFF, SB_SIZE, ST_ACTIVE, ST_DELETED, ST_DOWNLOADING};
 use index::Index;
 
 // pwrite 平台实现与 vfs/dlmgr 共用（modules/util.rs）。
@@ -112,7 +112,10 @@ pub(crate) fn pread(f: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
         while done < buf.len() {
             let n = f.seek_read(&mut buf[done..], off)?;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "vfs: seek_read read 0"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "vfs: seek_read read 0",
+                ));
             }
             done += n as usize;
             off += n as u64;
@@ -148,10 +151,13 @@ struct Slot {
 struct RegionLayout {
     active: Slot,
     inactive: Option<Slot>,
+    /// End of complete slots, including CRC-invalid ones; excludes partial appends.
+    append_end: u64,
 }
 
 /// commit 回调：§2.4 `cb(user, name, off, size, crc)`。存裸 fn 指针（Send+Sync），user 以 usize 保存。
-pub(crate) type VfsCommitFn = unsafe extern "C" fn(user: *mut c_void, name: *const c_char, off: u64, size: u64, crc: u32);
+pub(crate) type VfsCommitFn =
+    unsafe extern "C" fn(user: *mut c_void, name: *const c_char, off: u64, size: u64, crc: u32);
 
 struct VfsShared {
     /// files.vfs 实际路径：writer/整理重开句柄用。目录版 open 拼固定名，
@@ -182,15 +188,48 @@ impl VfsShared {
             return Err(VfsError::GenChanged);
         }
         let hf = self.header_file.lock().unwrap();
-        let hlen = hf.metadata().map_err(ioerr)?.len();
         let mut layout = self.layout.lock().unwrap();
-        // 仅等长复用：更小的 region 写进大槽会留死尾巴，重开时顺序扫描会卡在
-        // 死字节上终止，其后追加的槽位全部不可达（gen 回退、新文件消失）。
-        let dest = match layout.inactive {
-            Some(s) if bytes.len() as u64 == s.len => s,
-            _ => Slot { off: hlen, len: bytes.len() as u64 },
+        // Discard only an incomplete append left by a failed write.
+        let hlen = hf.metadata().map_err(ioerr)?.len();
+        if hlen < layout.append_end {
+            return Err(VfsError::Io);
+        }
+        if hlen > layout.append_end {
+            hf.set_len(layout.append_end).map_err(ioerr)?;
+        }
+        // An interrupted in-place write must not change the framing used to find
+        // later slots. Equal total length alone does not imply equal table/blob lengths.
+        let reusable = if let Some(s) = layout.inactive {
+            if bytes.len() as u64 == s.len {
+                let mut framing = [0u8; 8];
+                pread(&hf, s.off + 8, &mut framing).map_err(ioerr)?;
+                framing == bytes[8..16]
+            } else {
+                false
+            }
+        } else {
+            false
         };
-        pwrite(&hf, dest.off, bytes).map_err(ioerr)?;
+        let dest = if reusable {
+            layout.inactive.unwrap()
+        } else {
+            Slot {
+                off: layout.append_end,
+                len: bytes.len() as u64,
+            }
+        };
+        let end = dest
+            .off
+            .checked_add(dest.len)
+            .ok_or(VfsError::WriteOverflow)?;
+        if reusable {
+            // Leave the slot boundary fields untouched even during a torn write.
+            pwrite(&hf, dest.off, &bytes[..8]).map_err(ioerr)?;
+            pwrite(&hf, dest.off + 16, &bytes[16..]).map_err(ioerr)?;
+        } else {
+            pwrite(&hf, dest.off, bytes).map_err(ioerr)?;
+        }
+        layout.append_end = layout.append_end.max(end);
         hf.sync_all().map_err(ioerr)?;
         pwrite(&hf, SB_GEN_OFF, &format::sb_patch(gen)).map_err(ioerr)?;
         hf.sync_all().map_err(ioerr)?;
@@ -217,7 +256,12 @@ impl VfsShared {
 pub(crate) fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
     let (mut entries, names, gen, logical) = {
         let g = shared.inner.lock().unwrap();
-        (g.idx.entries.clone(), g.idx.names.clone(), g.idx.generation, g.idx.logical)
+        (
+            g.idx.entries.clone(),
+            g.idx.names.clone(),
+            g.idx.generation,
+            g.idx.logical,
+        )
     };
     shared.data_file.lock().unwrap().sync_all().map_err(ioerr)?;
     let img = format::build_region(gen, logical, &mut entries, &names);
@@ -285,7 +329,11 @@ impl Vfs {
             .open(index)
             .map_err(ioerr)?;
 
-        let header_bytes = std::fs::read(index).unwrap_or_default();
+        let header_bytes = std::fs::read(index).map_err(ioerr)?;
+        let physical = data_file.metadata().map_err(ioerr)?.len();
+        if header_bytes.is_empty() && physical != 0 {
+            return Err(VfsError::Io);
+        }
         let sb_gen = format::read_sb(&header_bytes);
         // 顺序扫描 region 槽位（头部不可读即终止——后续槽位无法定位）。
         let mut slots: Vec<SlotScan> = Vec::new();
@@ -319,18 +367,41 @@ impl Vfs {
             Some(s) => {
                 let p = s.parsed.as_ref().unwrap();
                 // Downloading 残留：条目丢弃，区间成垃圾（逻辑大小不动 → stat.garbage 计入）。
-                let entries: Vec<Entry> =
-                    p.entries.iter().filter(|e| e.state != ST_DOWNLOADING).copied().collect();
-                let active = Slot { off: s.off, len: s.total };
+                let entries: Vec<Entry> = p
+                    .entries
+                    .iter()
+                    .filter(|e| e.state != ST_DOWNLOADING)
+                    .copied()
+                    .collect();
+                let active = Slot {
+                    off: s.off,
+                    len: s.total,
+                };
                 let inactive = slots
                     .iter()
                     .filter(|o| o.off != s.off)
                     .max_by_key(|o| o.total)
-                    .map(|o| Slot { off: o.off, len: o.total });
-                (p.gen, p.logical, entries, p.names.clone(), RegionLayout { active, inactive })
+                    .map(|o| Slot {
+                        off: o.off,
+                        len: o.total,
+                    });
+                (
+                    p.gen,
+                    p.logical,
+                    entries,
+                    p.names.clone(),
+                    RegionLayout {
+                        active,
+                        inactive,
+                        append_end: pos as u64,
+                    },
+                )
             }
             None => {
-                // 全新或不可恢复：重置 header.vfs（SB + 空 region，gen=1）。
+                if !header_bytes.is_empty() {
+                    return Err(VfsError::Io);
+                }
+                // Initialize only an empty header/data pair.
                 let img = format::build_region(1, 0, &mut Vec::new(), &[]);
                 let mut buf = Vec::with_capacity(SB_SIZE as usize + img.bytes.len());
                 buf.extend_from_slice(&format::sb_image(1));
@@ -343,13 +414,24 @@ impl Vfs {
                     0,
                     Vec::new(),
                     Vec::new(),
-                    RegionLayout { active: Slot { off: SB_SIZE, len: img.bytes.len() as u64 }, inactive: None },
+                    RegionLayout {
+                        active: Slot {
+                            off: SB_SIZE,
+                            len: img.bytes.len() as u64,
+                        },
+                        inactive: None,
+                        append_end: buf.len() as u64,
+                    },
                 )
             }
         };
 
         // 物理小于逻辑（外部截断）则补齐；逻辑之外的物理残留忽略。
-        if data_file.metadata().map(|m| m.len()).unwrap_or(0) < logical {
+        if header_file.metadata().map_err(ioerr)?.len() != layout.append_end {
+            header_file.set_len(layout.append_end).map_err(ioerr)?;
+            header_file.sync_all().map_err(ioerr)?;
+        }
+        if physical < logical {
             data_file.set_len(logical).map_err(ioerr)?;
         }
 
@@ -367,7 +449,10 @@ impl Vfs {
             }),
             layout: Mutex::new(layout),
             commit_cb: Mutex::new(None),
-            ctl: CompactCtl { state: AtomicU32::new(COMPACT_IDLE), percent: AtomicU32::new(0) },
+            ctl: CompactCtl {
+                state: AtomicU32::new(COMPACT_IDLE),
+                percent: AtomicU32::new(0),
+            },
         });
         Ok(Vfs { shared })
     }
@@ -378,7 +463,7 @@ impl Vfs {
         if name.is_empty() || name.len() > u16::MAX as usize {
             return Err(VfsError::InvalidArg);
         }
-        let aligned = format::align4k(size);
+        let aligned = format::checked_align4k(size).ok_or(VfsError::WriteOverflow)?;
         let mut g = self.shared.inner.lock().unwrap();
         if g.compacting {
             return Err(VfsError::BusyCompacting);
@@ -387,12 +472,22 @@ impl Vfs {
             if e.state != ST_DELETED {
                 return Err(VfsError::AlreadyExists);
             }
-            g.idx.remove(name);
         }
-        let offset = format::align4k(g.idx.logical);
-        let logical = offset + aligned;
+        let offset = format::checked_align4k(g.idx.logical).ok_or(VfsError::WriteOverflow)?;
+        let logical = offset.checked_add(aligned).ok_or(VfsError::WriteOverflow)?;
+        g.idx.remove(name);
         g.idx.logical = logical;
-        g.idx.insert(name, Entry { name_off: 0, name_len: 0, state: ST_DOWNLOADING, offset, size, crc: 0 });
+        g.idx.insert(
+            name,
+            Entry {
+                name_off: 0,
+                name_len: 0,
+                state: ST_DOWNLOADING,
+                offset,
+                size,
+                crc: 0,
+            },
+        );
         // alloc/abort 同样 bump generation（Q12 意图：C# 感知任何索引变化）：
         // enumerate 两段式靠它失效旧 gen，否则 alloc 长名后按旧缓冲读会越界写。
         g.idx.generation += 1;
@@ -413,7 +508,11 @@ impl Vfs {
         }
         drop(g);
         // 每写入者独立 OS 句柄（Windows 同句柄并发 pwrite 不安全）。
-        let file = match OpenOptions::new().read(true).write(true).open(&self.shared.data_path) {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.shared.data_path)
+        {
             Ok(f) => f,
             Err(_) => {
                 if let Ok(mut g) = self.shared.inner.lock() {
@@ -474,7 +573,12 @@ impl Vfs {
             return Err(VfsError::BusyCompacting);
         }
         let e = g.idx.find(name).ok_or(VfsError::NotFound)?;
-        Ok(VfsEntryInfo { offset: e.offset, size: e.size, state: e.state, crc: e.crc })
+        Ok(VfsEntryInfo {
+            offset: e.offset,
+            size: e.size,
+            state: e.state,
+            crc: e.crc,
+        })
     }
 
     /// enumerate 两段式第 1 步：返回 (generation, 条目数, 名字 blob 字节数)。
@@ -484,7 +588,11 @@ impl Vfs {
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
-        Ok((g.idx.generation, g.idx.entries.len() as u32, g.idx.compact_blob_len()))
+        Ok((
+            g.idx.generation,
+            g.idx.entries.len() as u32,
+            g.idx.compact_blob_len(),
+        ))
     }
 
     /// FFI 用的尺寸预查（gen 变化即 GEN_CHANGED，避免按过期 blob_len 建切片）。
@@ -562,8 +670,22 @@ impl Vfs {
             }
         }
         let garbage = g.idx.logical.saturating_sub(total);
-        let physical = self.shared.data_file.lock().unwrap().metadata().map(|m| m.len()).unwrap_or(0);
-        VfsStat { logical: g.idx.logical, physical, total, active, deleted, garbage }
+        let physical = self
+            .shared
+            .data_file
+            .lock()
+            .unwrap()
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        VfsStat {
+            logical: g.idx.logical,
+            physical,
+            total,
+            active,
+            deleted,
+            garbage,
+        }
     }
 
     /// 异步碎片整理（§2.3）。有 writer → BUSY_WRITERS；整理中 → BUSY_COMPACTING。
@@ -586,9 +708,28 @@ impl Vfs {
             if g.writers != 0 {
                 return Err(VfsError::BusyWriters);
             }
+            let actives = g
+                .idx
+                .entries
+                .iter()
+                .filter(|e| e.state == ST_ACTIVE)
+                .map(|e| (g.idx.name_of(e).unwrap_or("").to_string(), *e))
+                .collect();
+            let plan = compact::build_plan(actives, g.idx.logical)?;
+            plan.new_logical
+                .checked_add(reserve_extra)
+                .ok_or(VfsError::InvalidArg)?;
             g.compacting = true;
         }
-        if compact::start(Arc::clone(&self.shared), reserve_extra, progress, done, user).is_err() {
+        if compact::start(
+            Arc::clone(&self.shared),
+            reserve_extra,
+            progress,
+            done,
+            user,
+        )
+        .is_err()
+        {
             let mut g = self.shared.inner.lock().unwrap();
             g.compacting = false;
             self.shared.ctl.state.store(COMPACT_IDLE, Ordering::Relaxed);
@@ -631,7 +772,9 @@ impl VfsWriter {
         if self.done {
             return Err(VfsError::StateInvalid);
         }
-        let end = rel_off.checked_add(data.len() as u64).ok_or(VfsError::WriteOverflow)?;
+        let end = rel_off
+            .checked_add(data.len() as u64)
+            .ok_or(VfsError::WriteOverflow)?;
         if end > self.size || rel_off > self.written {
             return Err(VfsError::WriteOverflow);
         }
@@ -684,7 +827,9 @@ impl VfsWriter {
             if g.compacting {
                 return Err(VfsError::BusyCompacting);
             }
-            let Some(e) = g.idx.find_mut(&self.name) else { return Err(VfsError::StateInvalid) };
+            let Some(e) = g.idx.find_mut(&self.name) else {
+                return Err(VfsError::StateInvalid);
+            };
             if e.state != ST_DOWNLOADING {
                 return Err(VfsError::StateInvalid);
             }
@@ -694,7 +839,8 @@ impl VfsWriter {
             g.writers -= 1;
             self.done = true;
         }
-        self.shared.fire_commit(&self.name, self.offset, self.size, crc);
+        self.shared
+            .fire_commit(&self.name, self.offset, self.size, crc);
         Ok(())
     }
 
@@ -727,7 +873,10 @@ unsafe fn cstr_arg(p: *const c_char) -> Result<String, VfsError> {
     if p.is_null() {
         return Err(VfsError::InvalidArg);
     }
-    CStr::from_ptr(p).to_str().map(|s| s.to_string()).map_err(|_| VfsError::InvalidArg)
+    CStr::from_ptr(p)
+        .to_str()
+        .map(|s| s.to_string())
+        .map_err(|_| VfsError::InvalidArg)
 }
 
 /// vfs C ABI 版本。
@@ -740,7 +889,9 @@ pub unsafe extern "C" fn vfs_abi_version() -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_open(dir: *const c_char) -> *mut c_void {
-    let Ok(d) = cstr_arg(dir) else { return ptr::null_mut() };
+    let Ok(d) = cstr_arg(dir) else {
+        return ptr::null_mut();
+    };
     match Vfs::open(Path::new(&d)) {
         Ok(v) => Arc::into_raw(Arc::new(v)) as *mut c_void,
         Err(_) => ptr::null_mut(),
@@ -752,7 +903,9 @@ pub unsafe extern "C" fn vfs_open(dir: *const c_char) -> *mut c_void {
 /// IO 失败均返回 NULL。
 #[no_mangle]
 pub unsafe extern "C" fn vfs_open_paths(index: *const c_char, data: *const c_char) -> *mut c_void {
-    let (Ok(i), Ok(d)) = (cstr_arg(index), cstr_arg(data)) else { return ptr::null_mut() };
+    let (Ok(i), Ok(d)) = (cstr_arg(index), cstr_arg(data)) else {
+        return ptr::null_mut();
+    };
     match Vfs::open_paths(Path::new(&i), Path::new(&d)) {
         Ok(v) => Arc::into_raw(Arc::new(v)) as *mut c_void,
         Err(_) => ptr::null_mut(),
@@ -771,14 +924,20 @@ pub unsafe extern "C" fn vfs_close(h: *mut c_void) {
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_flush(h: *mut c_void) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     code(v.flush())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_alloc(h: *mut c_void, name: *const c_char, size: u64) -> *mut c_void {
-    let Some(v) = (h as *const Vfs).as_ref() else { return ptr::null_mut() };
-    let Ok(n) = cstr_arg(name) else { return ptr::null_mut() };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return ptr::null_mut();
+    };
+    let Ok(n) = cstr_arg(name) else {
+        return ptr::null_mut();
+    };
     match v.alloc(&n, size) {
         Ok(w) => Box::into_raw(Box::new(w)) as *mut c_void,
         Err(_) => ptr::null_mut(),
@@ -786,32 +945,51 @@ pub unsafe extern "C" fn vfs_alloc(h: *mut c_void, name: *const c_char, size: u6
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vfs_writer_write(w: *mut c_void, rel_off: u64, buf: *const c_void, len: usize) -> c_int {
-    let Some(wr) = (w as *mut VfsWriter).as_mut() else { return VfsError::InvalidArg.as_i32() as c_int };
+pub unsafe extern "C" fn vfs_writer_write(
+    w: *mut c_void,
+    rel_off: u64,
+    buf: *const c_void,
+    len: usize,
+) -> c_int {
+    let Some(wr) = (w as *mut VfsWriter).as_mut() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     if len != 0 && buf.is_null() {
         return VfsError::InvalidArg.as_i32() as c_int;
     }
-    let data: &[u8] = if len == 0 { &[] } else { std::slice::from_raw_parts(buf as *const u8, len) };
+    let data: &[u8] = if len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(buf as *const u8, len)
+    };
     code(wr.write_at(rel_off, data))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_writer_commit(w: *mut c_void) -> c_int {
-    let Some(wr) = (w as *mut VfsWriter).as_mut() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(wr) = (w as *mut VfsWriter).as_mut() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     code(Box::from_raw(wr as *mut VfsWriter).commit())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_writer_abort(w: *mut c_void) -> c_int {
-    let Some(wr) = (w as *mut VfsWriter).as_mut() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(wr) = (w as *mut VfsWriter).as_mut() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     Box::from_raw(wr as *mut VfsWriter).abort();
     VFS_OK as c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn vfs_delete(h: *mut c_void, name: *const c_char) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
-    let Ok(n) = cstr_arg(name) else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
+    let Ok(n) = cstr_arg(name) else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     code(v.delete(&n))
 }
 
@@ -825,8 +1003,12 @@ pub unsafe extern "C" fn vfs_lookup(
     out_state: *mut c_int,
     out_crc: *mut u32,
 ) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
-    let Ok(n) = cstr_arg(name) else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
+    let Ok(n) = cstr_arg(name) else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     match v.lookup(&n) {
         Err(e) => e.as_i32() as c_int,
         Ok(i) => {
@@ -855,7 +1037,9 @@ pub unsafe extern "C" fn vfs_enumerate_query(
     out_count: *mut u32,
     out_blob_len: *mut u32,
 ) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     match v.enumerate_query() {
         Err(e) => e.as_i32() as c_int,
         Ok((gen, count, blen)) => {
@@ -886,7 +1070,9 @@ pub unsafe extern "C" fn vfs_enumerate_read(
     state: *mut c_int,
     cap: usize,
 ) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     let (count, blen) = match v.enumerate_meta(gen) {
         Ok(x) => x,
         Err(e) => return e.as_i32() as c_int,
@@ -894,10 +1080,19 @@ pub unsafe extern "C" fn vfs_enumerate_read(
     if cap < count {
         return VfsError::BufferTooSmall.as_i32() as c_int;
     }
-    if (blen != 0 && names_buf.is_null()) || off.is_null() || size.is_null() || crc.is_null() || state.is_null() {
+    if (blen != 0 && names_buf.is_null())
+        || off.is_null()
+        || size.is_null()
+        || crc.is_null()
+        || state.is_null()
+    {
         return VfsError::InvalidArg.as_i32() as c_int;
     }
-    let names: &mut [u8] = if blen == 0 { &mut [] } else { std::slice::from_raw_parts_mut(names_buf, blen) };
+    let names: &mut [u8] = if blen == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(names_buf, blen)
+    };
     let offs = std::slice::from_raw_parts_mut(off, cap);
     let sizes = std::slice::from_raw_parts_mut(size, cap);
     let crcs = std::slice::from_raw_parts_mut(crc, cap);
@@ -924,8 +1119,14 @@ pub unsafe extern "C" fn vfs_get_generation(h: *mut c_void) -> u64 {
 /// 可选 commit 回调；cb 传 NULL 清除。回调可能在任意调用 commit 的线程触发，
 /// 原生侧只存裸指针 —— C# 必须保证委托在句柄存活期有效（keep-alive）。
 #[no_mangle]
-pub unsafe extern "C" fn vfs_set_commit_callback(h: *mut c_void, cb: Option<VfsCommitFn>, user: *mut c_void) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+pub unsafe extern "C" fn vfs_set_commit_callback(
+    h: *mut c_void,
+    cb: Option<VfsCommitFn>,
+    user: *mut c_void,
+) -> c_int {
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     let mut g = v.shared.commit_cb.lock().unwrap();
     *g = cb.map(|f| (f, user as usize));
     VFS_OK as c_int
@@ -942,7 +1143,9 @@ pub unsafe extern "C" fn vfs_stat(
     out_deleted: *mut u64,
     out_garbage: *mut u64,
 ) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     let s = v.stat();
     if !out_logical.is_null() {
         *out_logical = s.logical;
@@ -976,14 +1179,22 @@ pub unsafe extern "C" fn vfs_compact(
     done_cb: Option<compact::DoneCb>,
     user: *mut c_void,
 ) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     code(v.compact_with(reserve_extra, progress_cb, done_cb, user as usize))
 }
 
 /// out 可空：state ∈ {Idle=0, Scan=1, Move=2, Finalize=3}，percent 0..100。
 #[no_mangle]
-pub unsafe extern "C" fn vfs_compact_status(h: *mut c_void, out_state: *mut c_int, out_percent: *mut c_int) -> c_int {
-    let Some(v) = (h as *const Vfs).as_ref() else { return VfsError::InvalidArg.as_i32() as c_int };
+pub unsafe extern "C" fn vfs_compact_status(
+    h: *mut c_void,
+    out_state: *mut c_int,
+    out_percent: *mut c_int,
+) -> c_int {
+    let Some(v) = (h as *const Vfs).as_ref() else {
+        return VfsError::InvalidArg.as_i32() as c_int;
+    };
     let (s, p) = v.compact_status();
     if !out_state.is_null() {
         *out_state = s as c_int;
@@ -1091,7 +1302,10 @@ mod tests {
         assert_eq!(&raw[ia.offset as usize..ia.offset as usize + 5000], &a[..]);
         let ib = v.lookup("beta.dat").unwrap();
         assert_eq!(ib.crc, format::crc32(&b));
-        assert_eq!(&raw[ib.offset as usize..ib.offset as usize + b.len()], &b[..]);
+        assert_eq!(
+            &raw[ib.offset as usize..ib.offset as usize + b.len()],
+            &b[..]
+        );
     }
 
     /// 单 region 翻转后另一份可被恢复路径选中（人为破坏 active region）。
@@ -1160,8 +1374,11 @@ mod tests {
         let v = Vfs::open(&td.0).unwrap();
         seq_write(&v, "f1", &[1u8; 100]).unwrap(); // gen: 1 → 2
         v.flush().unwrap(); // 水位线落定为 flush 时的 idx.generation = 2
-        // 旧 gen（1 < 水位线 2）模拟滞后的 flush：拒绝且不动 SuperBlock。
-        assert!(matches!(v.shared.persist_image(1, &[]), Err(VfsError::GenChanged)));
+                            // 旧 gen（1 < 水位线 2）模拟滞后的 flush：拒绝且不动 SuperBlock。
+        assert!(matches!(
+            v.shared.persist_image(1, &[]),
+            Err(VfsError::GenChanged)
+        ));
         // 同 gen（== 水位线）重复 flush 合法：写闲置槽 + 翻转无害。
         v.flush().unwrap();
         // gen 前进后 flush 正常。
@@ -1208,7 +1425,15 @@ mod tests {
         let mut sizes = vec![0u64; count as usize];
         let mut crcs = vec![0u32; count as usize];
         let mut states = vec![0u8; count as usize];
-        v.enumerate_read(gen, &mut names, &mut offs, &mut sizes, &mut crcs, &mut states).unwrap();
+        v.enumerate_read(
+            gen,
+            &mut names,
+            &mut offs,
+            &mut sizes,
+            &mut crcs,
+            &mut states,
+        )
+        .unwrap();
         let got: Vec<&str> = names
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
@@ -1218,7 +1443,14 @@ mod tests {
 
         seq_write(&v, "gamma", &[3u8; 30]).unwrap(); // gen 变化
         assert!(matches!(
-            v.enumerate_read(gen, &mut names, &mut offs, &mut sizes, &mut crcs, &mut states),
+            v.enumerate_read(
+                gen,
+                &mut names,
+                &mut offs,
+                &mut sizes,
+                &mut crcs,
+                &mut states
+            ),
             Err(VfsError::GenChanged)
         ));
         let (gen2, count2, blen2) = v.enumerate_query().unwrap();
@@ -1228,7 +1460,15 @@ mod tests {
         let mut sizes2 = vec![0u64; count2 as usize];
         let mut crcs2 = vec![0u32; count2 as usize];
         let mut states2 = vec![0u8; count2 as usize];
-        v.enumerate_read(gen2, &mut names2, &mut offs2, &mut sizes2, &mut crcs2, &mut states2).unwrap();
+        v.enumerate_read(
+            gen2,
+            &mut names2,
+            &mut offs2,
+            &mut sizes2,
+            &mut crcs2,
+            &mut states2,
+        )
+        .unwrap();
         assert_eq!(states2[2], ST_ACTIVE);
     }
 
@@ -1252,10 +1492,149 @@ mod tests {
         let mut sizes = vec![0u64; count as usize];
         let mut crcs = vec![0u32; count as usize];
         let mut states = vec![0u8; count as usize];
-        v.enumerate_read(gen, &mut names, &mut offs, &mut sizes, &mut crcs, &mut states).unwrap();
+        v.enumerate_read(
+            gen,
+            &mut names,
+            &mut offs,
+            &mut sizes,
+            &mut crcs,
+            &mut states,
+        )
+        .unwrap();
         let ia = v.lookup("f0.bin").unwrap();
         assert_eq!(ia.crc, format::crc32(&[0u8; 16]));
         assert_eq!(v.lookup("f19999.bin").unwrap().size, 16);
+    }
+
+    #[test]
+    fn alloc_overflow_preserves_deleted_entry_and_index() {
+        let td = TempDir::new();
+        let v = Vfs::open(&td.0).unwrap();
+        seq_write(&v, "keep", &[7]).unwrap();
+        v.delete("keep").unwrap();
+        let gen = v.get_generation();
+        let logical = v.stat().logical;
+        assert!(matches!(
+            v.alloc("keep", u64::MAX),
+            Err(VfsError::WriteOverflow)
+        ));
+        assert_eq!(v.lookup("keep").unwrap().state, ST_DELETED);
+        assert_eq!(v.get_generation(), gen);
+        assert_eq!(v.stat().logical, logical);
+        {
+            let mut g = v.shared.inner.lock().unwrap();
+            g.idx.logical = u64::MAX - 4095;
+        }
+        assert!(matches!(
+            v.alloc("keep", 4096),
+            Err(VfsError::WriteOverflow)
+        ));
+        assert_eq!(v.lookup("keep").unwrap().state, ST_DELETED);
+        assert_eq!(v.get_generation(), gen);
+        let g = v.shared.inner.lock().unwrap();
+        assert_eq!(g.writers, 0);
+        assert_eq!(g.idx.entries.len(), 1);
+    }
+
+    #[test]
+    fn open_rejects_unrecoverable_header_without_mutation() {
+        let td = TempDir::new();
+        let hp = td.0.join("header.vfs");
+        let dp = td.0.join("files.vfs");
+        fs::write(&dp, b"payload").unwrap();
+        for header in [b"".as_slice(), b"broken header".as_slice()] {
+            fs::write(&hp, header).unwrap();
+            assert!(matches!(Vfs::open(&td.0), Err(VfsError::Io)));
+            assert_eq!(fs::read(&hp).unwrap(), header);
+            assert_eq!(fs::read(&dp).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    fn truncated_append_recovers_on_open_and_same_handle_retry() {
+        for (reopen, cut) in [(false, 17), (true, 17), (false, 40), (true, 40)] {
+            let td = TempDir::new();
+            let mut v = Vfs::open(&td.0).unwrap();
+            seq_write(&v, "keep", &[1]).unwrap();
+            v.flush().unwrap();
+            let hp = td.0.join("header.vfs");
+            let end = fs::metadata(&hp).unwrap().len();
+            let mut entries = [Entry {
+                name_off: 0,
+                name_len: 1,
+                state: ST_ACTIVE,
+                offset: 0,
+                size: 1,
+                crc: 0,
+            }];
+            let img = format::build_region(99, 4096, &mut entries, b"x\0");
+            let hf = OpenOptions::new().write(true).open(&hp).unwrap();
+            // Model the partial bytes left by a failed append write.
+            pwrite(&hf, end, &img.bytes[..cut]).unwrap();
+            drop(hf);
+            if reopen {
+                drop(v);
+                v = Vfs::open(&td.0).unwrap();
+                assert_eq!(fs::metadata(&hp).unwrap().len(), end);
+            }
+            seq_write(&v, "later-longer-name", &[2]).unwrap();
+            v.flush().unwrap();
+            drop(v);
+            let v = Vfs::open(&td.0).unwrap();
+            assert!(v.lookup("keep").is_ok());
+            assert!(v.lookup("later-longer-name").is_ok());
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_complete_bad_slot_and_later_valid_slot() {
+        let td = TempDir::new();
+        let v = Vfs::open(&td.0).unwrap();
+        seq_write(&v, "keep", &[1]).unwrap();
+        v.flush().unwrap();
+        drop(v);
+        let hp = td.0.join("header.vfs");
+        let mut bytes = fs::read(&hp).unwrap();
+        let mut bad = format::build_region(90, 0, &mut [], &[]).bytes;
+        bad[16] ^= 1;
+        let bad_off = bytes.len();
+        bytes.extend_from_slice(&bad);
+        let later = format::build_region(100, 0, &mut [], &[]).bytes;
+        bytes.extend_from_slice(&later);
+        bytes[..64].copy_from_slice(&format::sb_image(100));
+        let end = bytes.len();
+        bytes.extend_from_slice(&[0; 7]);
+        fs::write(&hp, &bytes).unwrap();
+        let v = Vfs::open(&td.0).unwrap();
+        assert_eq!(v.get_generation(), 100);
+        let recovered = fs::read(&hp).unwrap();
+        assert_eq!(recovered.len(), end);
+        assert_eq!(&recovered[bad_off..bad_off + bad.len()], &bad);
+        seq_write(&v, "next", &[3]).unwrap();
+        v.flush().unwrap();
+        drop(v);
+        assert!(Vfs::open(&td.0).unwrap().lookup("next").is_ok());
+    }
+
+    #[test]
+    fn compact_reserve_overflow_does_not_publish_or_move() {
+        let td = TempDir::new();
+        let v = Vfs::open(&td.0).unwrap();
+        seq_write(&v, "gap", &[1]).unwrap();
+        seq_write(&v, "keep", &[4; 8192]).unwrap();
+        v.delete("gap").unwrap();
+        let before = fs::read(td.0.join("header.vfs")).unwrap();
+        let data = data_of(&td.0);
+        assert!(matches!(v.compact(u64::MAX), Err(VfsError::InvalidArg)));
+        // Fits the old logical size, but not this round's append destination.
+        assert!(matches!(
+            v.compact(u64::MAX - v.stat().logical),
+            Err(VfsError::InvalidArg)
+        ));
+        assert_eq!(v.compact_status().0, COMPACT_IDLE);
+        assert_eq!(fs::read(td.0.join("header.vfs")).unwrap(), before);
+        assert_eq!(data_of(&td.0), data);
+        assert_eq!(v.lookup("keep").unwrap().offset, 4096);
     }
 
     // --- T2 ---
@@ -1272,16 +1651,21 @@ mod tests {
             crc: 0,
         };
         // 首部空洞 → 前移进空洞
-        let p = compact::build_plan(vec![("a".into(), e(4096, 4096))], 8192);
+        let p = compact::build_plan(vec![("a".into(), e(4096, 4096))], 8192).unwrap();
         assert_eq!(p.items[0].new_off, 0);
         assert_eq!(p.new_logical, 4096);
         // gap < size → 搬到旧逻辑末尾之后；前一条 offset==cursor 原地不动
-        let p = compact::build_plan(vec![("a".into(), e(0, 4096)), ("b".into(), e(12288, 12288))], 16384);
+        let p = compact::build_plan(
+            vec![("a".into(), e(0, 4096)), ("b".into(), e(12288, 12288))],
+            24576,
+        )
+        .unwrap();
         assert_eq!(p.items[0].new_off, 0);
-        assert_eq!(p.items[1].new_off, 16384);
-        assert_eq!(p.new_logical, 16384 + 12288);
+        assert_eq!(p.items[1].new_off, 24576);
+        assert_eq!(p.new_logical, 24576 + 12288);
+        assert!(p.excluded_any);
         // 尾部大空洞 → 不搬
-        let p = compact::build_plan(vec![("a".into(), e(0, 4096))], 1 << 20);
+        let p = compact::build_plan(vec![("a".into(), e(0, 4096))], 1 << 20).unwrap();
         assert_eq!(p.items[0].new_off, 0);
         assert_eq!(p.copy_total, 0);
     }
@@ -1301,9 +1685,14 @@ mod tests {
         // a@0 原地；b@4096 已删除（不进 plan）；c@8192 前移进 b 的已删区；
         // d@12288 的候选 [8192,12288) 是 c 的旧源区 → 排挤到旧逻辑末尾之后。
         let p = compact::build_plan(
-            vec![("a".into(), e(0)), ("c".into(), e(8192)), ("d".into(), e(12288))],
+            vec![
+                ("a".into(), e(0)),
+                ("c".into(), e(8192)),
+                ("d".into(), e(12288)),
+            ],
             16384,
-        );
+        )
+        .unwrap();
         assert_eq!(p.items[0].new_off, 0);
         assert_eq!(p.items[1].new_off, 4096);
         assert_eq!(p.items[2].new_off, 16384);
@@ -1359,12 +1748,12 @@ mod tests {
         wait_idle(&v);
 
         assert_eq!(v.lookup("f1").unwrap().offset, 0); // 原地
-        assert_eq!(v.lookup("f3").unwrap().offset, 24576);
+        assert_eq!(v.lookup("f3").unwrap().offset, 4096);
         let s = v.stat();
-        assert_eq!(s.logical, 24576 + 12288);
+        assert_eq!(s.logical, 16384);
         assert_eq!(s.physical, s.logical);
         let raw = data_of(&td.0);
-        assert_eq!(&raw[24576..24576 + 12288], &d3[..]);
+        assert_eq!(&raw[4096..16384], &d3[..]);
     }
 
     /// BUSY 并发规则：有 writer → BUSY_WRITERS；整理期间 lookup/alloc/delete/flush 全
@@ -1408,7 +1797,10 @@ mod tests {
         seq_write(&v, "f2", &d2).unwrap();
         // 绕过 writer 直接破坏 f2 的磁盘数据
         let i2 = v.lookup("f2").unwrap();
-        let df = OpenOptions::new().write(true).open(td.0.join("files.vfs")).unwrap();
+        let df = OpenOptions::new()
+            .write(true)
+            .open(td.0.join("files.vfs"))
+            .unwrap();
         pwrite(&df, i2.offset, &[0u8; 64]).unwrap();
         drop(df);
 
@@ -1458,6 +1850,35 @@ mod tests {
 
     // --- 本轮评审回归 ---
 
+    #[test]
+    fn equal_size_slots_with_different_framing_are_not_reused() {
+        let td = TempDir::new();
+        let v = Vfs::open(&td.0).unwrap();
+        let old = v.alloc(&"x".repeat(37), 0).unwrap();
+        v.flush().unwrap();
+        let old_slot = v.shared.layout.lock().unwrap().active;
+        old.abort();
+        let first = v.alloc("a", 0).unwrap();
+        let second = v.alloc("bbb", 0).unwrap();
+        v.flush().unwrap();
+        let active = v.shared.layout.lock().unwrap().active;
+        assert_eq!(old_slot.len, active.len);
+        first.commit().unwrap();
+        second.commit().unwrap();
+        let hp = td.0.join("header.vfs");
+        let before = fs::read(&hp).unwrap();
+        v.flush().unwrap();
+        let after = fs::read(&hp).unwrap();
+        let start = old_slot.off as usize;
+        let end = start + old_slot.len as usize;
+        assert_eq!(&after[start..end], &before[start..end]);
+        assert!(after.len() > before.len());
+        drop(v);
+        let reopened = Vfs::open(&td.0).unwrap();
+        assert_eq!(reopened.lookup("a").unwrap().state, ST_ACTIVE);
+        assert_eq!(reopened.lookup("bbb").unwrap().state, ST_ACTIVE);
+    }
+
     /// R05：更小的 region 不得复用更大的闲置槽位——死尾巴会卡死重开时的顺序扫描，
     /// 其后追加的槽位全部不可达（gen 回退、新文件消失）。
     #[test]
@@ -1498,16 +1919,28 @@ mod tests {
         // abort 后按旧 gen 读 → GEN_CHANGED（条目数变了）
         w.abort();
         assert!(matches!(
-            v.enumerate_read(gen, &mut vec![0u8; blen as usize], &mut vec![0u64; 2],
-                             &mut vec![0u64; 2], &mut vec![0u32; 2], &mut vec![0u8; 2]),
+            v.enumerate_read(
+                gen,
+                &mut vec![0u8; blen as usize],
+                &mut vec![0u64; 2],
+                &mut vec![0u64; 2],
+                &mut vec![0u32; 2],
+                &mut vec![0u8; 2]
+            ),
             Err(VfsError::GenChanged)
         ));
 
         // 长名 alloc 后仍按旧 gen 读 → GEN_CHANGED（修复前：blen 变大 → 越界写）
         let w2 = v.alloc(&"x".repeat(4096), 10).unwrap();
         assert!(matches!(
-            v.enumerate_read(gen, &mut vec![0u8; blen as usize], &mut vec![0u64; 2],
-                             &mut vec![0u64; 2], &mut vec![0u32; 2], &mut vec![0u8; 2]),
+            v.enumerate_read(
+                gen,
+                &mut vec![0u8; blen as usize],
+                &mut vec![0u64; 2],
+                &mut vec![0u64; 2],
+                &mut vec![0u32; 2],
+                &mut vec![0u8; 2]
+            ),
             Err(VfsError::GenChanged)
         ));
         w2.abort();
@@ -1520,7 +1953,15 @@ mod tests {
         let mut sizes = vec![0u64; count2 as usize];
         let mut crcs = vec![0u32; count2 as usize];
         let mut states = vec![0u8; count2 as usize];
-        v.enumerate_read(gen2, &mut names, &mut offs, &mut sizes, &mut crcs, &mut states).unwrap();
+        v.enumerate_read(
+            gen2,
+            &mut names,
+            &mut offs,
+            &mut sizes,
+            &mut crcs,
+            &mut states,
+        )
+        .unwrap();
         let got: Vec<&str> = names
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
@@ -1592,7 +2033,7 @@ mod tests {
         let h = unsafe { vfs_open_paths(i.as_ptr(), d.as_ptr()) };
         assert!(!h.is_null());
         unsafe { vfs_close(h) }; // 先 close：Windows 下打开的句柄会挡住 TempDir 清理
-        // 防呆经 FFI：同路径 → NULL（顺带钉死 index/data 参数顺序不颠倒）
+                                 // 防呆经 FFI：同路径 → NULL（顺带钉死 index/data 参数顺序不颠倒）
         let same = CString::new(td.0.join("x.vfs").to_str().unwrap()).unwrap();
         assert!(unsafe { vfs_open_paths(same.as_ptr(), same.as_ptr()) }.is_null());
         assert!(unsafe { vfs_open_paths(ptr::null(), d.as_ptr()) }.is_null());

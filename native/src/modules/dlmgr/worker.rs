@@ -7,11 +7,8 @@ use std::time::{Duration, Instant};
 
 use libc::{c_char, c_void, size_t};
 
-use super::curlw_backend::{
-    Easy, HeaderList, WriteCb, CURLE_FAILED_INIT, CURLINFO_RESPONSE_CODE,
-};
 use super::curlw_backend::CURLE_OPERATION_TIMEDOUT;
-use crate::modules::curlw::curlw_easy_getinfo_long;
+use super::curlw_backend::{Easy, HeaderList, WriteCb, CURLE_FAILED_INIT, CURLINFO_RESPONSE_CODE};
 use super::rate::{SpeedLimiter, TokenBucket};
 use super::sink::{sink_lookup, SinkVTable};
 use super::task::{
@@ -19,8 +16,9 @@ use super::task::{
     ERR_SIZE_MISMATCH, ERR_TIMEOUT, ERR_UNSUPPORTED_RANGE, TASK_CANCELED, TASK_DONE, TASK_FAILED,
     TASK_RUNNING, TASK_VERIFYING,
 };
-use super::Shared;
 use super::SendPtr;
+use super::Shared;
+use crate::modules::curlw::curlw_easy_getinfo_long;
 
 // --- curl 写回调上下文：限速 / 取消 / 闸门全部在这里做（活于单次 perform 期间）---
 
@@ -30,16 +28,21 @@ struct WriteCtx<'a> {
     limiter: &'a SpeedLimiter,
     task_bucket: Option<&'a TokenBucket>,
     task: &'a TaskShared,
-    total: u64, // 任务 size（写入越界 = 源不可信）
-    range_mode: bool, // true = range_url 阶段，必须 206
-    off: &'a AtomicU64,   // 下一个写入偏移（= 已收字节）
-    crc: &'a AtomicU32,   // 流式 crc32 状态（断线重连延续）
-    bad: &'a AtomicI32,   // 0 无 / 1 非 206 → UNSUPPORTED_RANGE / 2 越界 → SIZE_MISMATCH
+    total: u64,         // 任务 size（写入越界 = 源不可信）
+    range_mode: bool,   // true = range_url 阶段，必须 206
+    off: &'a AtomicU64, // 下一个写入偏移（= 已收字节）
+    crc: &'a AtomicU32, // 流式 crc32 状态（断线重连延续）
+    bad: &'a AtomicI32, // 0 无 / 1 非 206 → UNSUPPORTED_RANGE / 2 越界 → SIZE_MISMATCH
     io_err: &'a AtomicBool,
 }
 
 /// curl 写回调：写 sink 前从双桶取 token；返回 0 触发中止（cancel / 闸门失败 / sink 错误）。
-unsafe extern "C" fn write_cb(ptr: *mut c_char, size: size_t, nmemb: size_t, ud: *mut c_void) -> size_t {
+unsafe extern "C" fn write_cb(
+    ptr: *mut c_char,
+    size: size_t,
+    nmemb: size_t,
+    ud: *mut c_void,
+) -> size_t {
     let ctx = &*(ud as *const WriteCtx);
     let len = size.saturating_mul(nmemb);
     if len == 0 {
@@ -85,7 +88,9 @@ unsafe extern "C" fn write_cb(ptr: *mut c_char, size: size_t, nmemb: size_t, ud:
         let c = crc32_update(ctx.crc.load(Ordering::Relaxed), chunk);
         ctx.crc.store(c, Ordering::Relaxed);
         ctx.off.store(off + allow as u64, Ordering::Relaxed);
-        ctx.task.bytes_done.fetch_add(allow as u64, Ordering::Relaxed);
+        ctx.task
+            .bytes_done
+            .fetch_add(allow as u64, Ordering::Relaxed);
         p = p.add(allow);
         left -= allow;
     }
@@ -96,38 +101,44 @@ unsafe extern "C" fn write_cb(ptr: *mut c_char, size: size_t, nmemb: size_t, ud:
 
 /// 一次 perform 的汇总结果。
 pub(crate) enum AttemptOutcome {
-    Canceled,                    // 任务被取消（旗标，先于一切判定）
-    SinkError,                   // sink 写失败（不重试）
-    GateFail(i32),               // 回调内已判定的闸门失败：非 206 / 越界
-    HttpOk {                     // curl 干净返回
+    Canceled,      // 任务被取消（旗标，先于一切判定）
+    SinkError,     // sink 写失败（不重试）
+    GateFail(i32), // 回调内已判定的闸门失败：非 206 / 越界
+    HttpOk {
+        // curl 干净返回
         resp: i64,
-        cr: Option<(u64, u64)>,  // Content-Range (起始偏移, 总长)
-        clen: i64,               // Content-Length（未知 = -1）
-        complete: bool,          // 收满任务 size
+        cr: Option<(u64, u64)>, // Content-Range (起始偏移, 总长)
+        clen: i64,              // Content-Length（未知 = -1）
+        complete: bool,         // 收满任务 size
         crc_ok: bool,
     },
-    NetErr(i32),                 // curl 网络错误码
+    NetErr(i32), // curl 网络错误码
 }
 
 /// 跨尝试运行态。
 pub(crate) struct RunState {
     pub(crate) range_phase: bool, // true=range_url 阶段 / false=full_url 阶段
     pub(crate) fallback_used: bool,
-    pub(crate) retries: u32,      // 已耗重试次数（共享预算）
+    pub(crate) retries: u32, // 已耗重试次数（共享预算）
     pub(crate) last_err: i32,
 }
 
 /// 下一拍动作。
 pub(crate) enum Decision {
-    Done,             // → Verifying → sink.finish → Done
-    Resume,           // 原阶段带断点重试（range：off/crc 延续，耗 retry，先退避）
-    RestartFromZero,  // 原阶段从头重下（off>0 时 sink.reset，耗 retry，先退避）
-    Fallback(i32),    // 切 full_url 从 0 重下（不耗 retry）
-    Fail(i32),        // 终态（ERR_CANCELED → Canceled，其余 → Failed）
+    Done,            // → Verifying → sink.finish → Done
+    Resume,          // 原阶段带断点重试（range：off/crc 延续，耗 retry，先退避）
+    RestartFromZero, // 原阶段从头重下（off>0 时 sink.reset，耗 retry，先退避）
+    Fallback(i32),   // 切 full_url 从 0 重下（不耗 retry）
+    Fail(i32),       // 终态（ERR_CANCELED → Canceled，其余 → Failed）
 }
 
 /// §3.2 状态转移（纯函数）：三道闸判源不可信 → 至多一次兜底；full_url 失败耗 retry。
-pub(crate) fn transition(st: &mut RunState, out: &AttemptOutcome, size: u64, retry_count: u32) -> Decision {
+pub(crate) fn transition(
+    st: &mut RunState,
+    out: &AttemptOutcome,
+    size: u64,
+    retry_count: u32,
+) -> Decision {
     match out {
         AttemptOutcome::Canceled => Decision::Fail(ERR_CANCELED),
         AttemptOutcome::SinkError => Decision::Fail(ERR_NETWORK),
@@ -142,7 +153,13 @@ pub(crate) fn transition(st: &mut RunState, out: &AttemptOutcome, size: u64, ret
                 Decision::Fail(*kind)
             }
         }
-        AttemptOutcome::HttpOk { resp, cr, clen, complete, crc_ok } => {
+        AttemptOutcome::HttpOk {
+            resp,
+            cr,
+            clen,
+            complete,
+            crc_ok,
+        } => {
             if st.range_phase {
                 if *resp != 206 {
                     // 非 206（200 / 416 / 4xx…）→ 源不支持 range → 兜底
@@ -187,7 +204,11 @@ pub(crate) fn transition(st: &mut RunState, out: &AttemptOutcome, size: u64, ret
             }
         }
         AttemptOutcome::NetErr(code) => {
-            let err = if *code == CURLE_OPERATION_TIMEDOUT { ERR_TIMEOUT } else { ERR_NETWORK };
+            let err = if *code == CURLE_OPERATION_TIMEDOUT {
+                ERR_TIMEOUT
+            } else {
+                ERR_NETWORK
+            };
             net_retry(st, err, retry_count)
         }
     }
@@ -198,7 +219,11 @@ fn net_retry(st: &mut RunState, err: i32, retry_count: u32) -> Decision {
     st.last_err = err;
     if st.retries < retry_count {
         st.retries += 1;
-        if st.range_phase { Decision::Resume } else { Decision::RestartFromZero }
+        if st.range_phase {
+            Decision::Resume
+        } else {
+            Decision::RestartFromZero
+        }
     } else if st.range_phase && !st.fallback_used {
         Decision::Fallback(err)
     } else {
@@ -258,6 +283,7 @@ fn take_task(sh: &Shared) -> Option<Arc<TaskShared>> {
 }
 
 fn worker_loop(sh: Arc<Shared>, share: SendPtr, doh: Option<&str>) {
+    let _thread_guard = super::InternalThreadGuard::enter(&sh);
     let easy = Easy::new_configured(share.0, doh);
     while let Some(task) = take_task(&sh) {
         match easy.as_ref() {
@@ -316,7 +342,12 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
     let task_bucket = (task.task_bps > 0).then(|| TokenBucket::new(task.task_bps));
     let mut off = 0u64;
     let mut crc = 0u32;
-    let mut st = RunState { range_phase: true, fallback_used: false, retries: 0, last_err: ERR_OK };
+    let mut st = RunState {
+        range_phase: true,
+        fallback_used: false,
+        retries: 0,
+        last_err: ERR_OK,
+    };
 
     loop {
         if task.cancel.load(Ordering::Relaxed) {
@@ -325,8 +356,22 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
             return;
         }
 
-        let url = if st.range_phase { &task.range_url } else { &task.full_url };
-        let out = perform_attempt(sh, task, easy, &vt, &st, &mut off, &mut crc, url, task_bucket.as_ref());
+        let url = if st.range_phase {
+            &task.range_url
+        } else {
+            &task.full_url
+        };
+        let out = perform_attempt(
+            sh,
+            task,
+            easy,
+            &vt,
+            &st,
+            &mut off,
+            &mut crc,
+            url,
+            task_bucket.as_ref(),
+        );
 
         match transition(&mut st, &out, task.size, sh.retry_count) {
             Decision::Done => {
@@ -450,11 +495,21 @@ fn perform_attempt(
         return AttemptOutcome::NetErr(code);
     }
     let resp = easy.response_code();
-    let cr = if st.range_phase { easy.content_range() } else { None };
+    let cr = if st.range_phase {
+        easy.content_range()
+    } else {
+        None
+    };
     let clen = easy.content_length();
     let complete = *off == task.size;
     let crc_ok = *crc_out == task.crc;
-    AttemptOutcome::HttpOk { resp, cr, clen, complete, crc_ok }
+    AttemptOutcome::HttpOk {
+        resp,
+        cr,
+        clen,
+        complete,
+        crc_ok,
+    }
 }
 
 #[cfg(test)]
@@ -464,11 +519,28 @@ mod tests {
     const SIZE: u64 = 100;
 
     fn rs(range: bool, fb: bool, retries: u32) -> RunState {
-        RunState { range_phase: range, fallback_used: fb, retries, last_err: ERR_OK }
+        RunState {
+            range_phase: range,
+            fallback_used: fb,
+            retries,
+            last_err: ERR_OK,
+        }
     }
 
-    fn http_ok(resp: i64, cr: Option<(u64, u64)>, clen: i64, complete: bool, crc_ok: bool) -> AttemptOutcome {
-        AttemptOutcome::HttpOk { resp, cr, clen, complete, crc_ok }
+    fn http_ok(
+        resp: i64,
+        cr: Option<(u64, u64)>,
+        clen: i64,
+        complete: bool,
+        crc_ok: bool,
+    ) -> AttemptOutcome {
+        AttemptOutcome::HttpOk {
+            resp,
+            cr,
+            clen,
+            complete,
+            crc_ok,
+        }
     }
 
     #[test]
@@ -501,7 +573,12 @@ mod tests {
         // 起始偏移不设闸（Q1 决策）：总长相符即放行，错源由 crc 兜底；
         // 字节不足（complete=false）视同断线，走断点重试
         assert!(matches!(
-            transition(&mut st, &http_ok(206, Some((5, SIZE)), -1, false, true), SIZE, 3),
+            transition(
+                &mut st,
+                &http_ok(206, Some((5, SIZE)), -1, false, true),
+                SIZE,
+                3
+            ),
             Decision::Resume
         ));
         // Content-Range 缺失
@@ -525,7 +602,12 @@ mod tests {
     fn range_done_when_complete_and_crc_ok() {
         let mut st = rs(true, false, 0);
         assert!(matches!(
-            transition(&mut st, &http_ok(206, Some((0, SIZE)), SIZE as i64, true, true), SIZE, 3),
+            transition(
+                &mut st,
+                &http_ok(206, Some((0, SIZE)), SIZE as i64, true, true),
+                SIZE,
+                3
+            ),
             Decision::Done
         ));
     }
@@ -534,7 +616,10 @@ mod tests {
     fn range_neterr_resumes_then_falls_back_when_exhausted() {
         let mut st = rs(true, false, 0);
         for expect in 1..=3u32 {
-            assert!(matches!(transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3), Decision::Resume));
+            assert!(matches!(
+                transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3),
+                Decision::Resume
+            ));
             assert_eq!(st.retries, expect);
         }
         // 预算用尽且未兜底 → 兜底
@@ -547,7 +632,15 @@ mod tests {
     #[test]
     fn timeout_maps_to_timeout_err() {
         let mut st = rs(true, false, 0);
-        assert!(matches!(transition(&mut st, &AttemptOutcome::NetErr(CURLE_OPERATION_TIMEDOUT), SIZE, 3), Decision::Resume));
+        assert!(matches!(
+            transition(
+                &mut st,
+                &AttemptOutcome::NetErr(CURLE_OPERATION_TIMEDOUT),
+                SIZE,
+                3
+            ),
+            Decision::Resume
+        ));
         assert_eq!(st.last_err, ERR_TIMEOUT);
     }
 
@@ -555,12 +648,22 @@ mod tests {
     fn gatefail_on_full_phase_consumes_retry_then_fails() {
         let mut st = rs(false, true, 0);
         assert!(matches!(
-            transition(&mut st, &AttemptOutcome::GateFail(ERR_SIZE_MISMATCH), SIZE, 2),
+            transition(
+                &mut st,
+                &AttemptOutcome::GateFail(ERR_SIZE_MISMATCH),
+                SIZE,
+                2
+            ),
             Decision::RestartFromZero
         ));
         assert_eq!(st.retries, 1);
         assert!(matches!(
-            transition(&mut st, &AttemptOutcome::GateFail(ERR_SIZE_MISMATCH), SIZE, 2),
+            transition(
+                &mut st,
+                &AttemptOutcome::GateFail(ERR_SIZE_MISMATCH),
+                SIZE,
+                2
+            ),
             Decision::RestartFromZero
         ));
         assert!(matches!(
@@ -573,7 +676,12 @@ mod tests {
     fn full_crc_mismatch_consumes_retry_then_fails() {
         let mut st = rs(false, true, 0);
         assert!(matches!(
-            transition(&mut st, &http_ok(200, None, SIZE as i64, true, false), SIZE, 1),
+            transition(
+                &mut st,
+                &http_ok(200, None, SIZE as i64, true, false),
+                SIZE,
+                1
+            ),
             Decision::RestartFromZero
         ));
         assert_eq!(st.last_err, ERR_CRC_MISMATCH);
@@ -596,9 +704,18 @@ mod tests {
     #[test]
     fn full_neterr_retries_from_zero_then_fails() {
         let mut st = rs(false, true, 0);
-        assert!(matches!(transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3), Decision::RestartFromZero));
-        assert!(matches!(transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3), Decision::RestartFromZero));
-        assert!(matches!(transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3), Decision::RestartFromZero));
+        assert!(matches!(
+            transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3),
+            Decision::RestartFromZero
+        ));
+        assert!(matches!(
+            transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3),
+            Decision::RestartFromZero
+        ));
+        assert!(matches!(
+            transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3),
+            Decision::RestartFromZero
+        ));
         assert!(matches!(
             transition(&mut st, &AttemptOutcome::NetErr(7), SIZE, 3),
             Decision::Fail(e) if e == ERR_NETWORK

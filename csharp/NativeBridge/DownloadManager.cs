@@ -13,7 +13,8 @@
 //     single connection per task) plus a 10 Hz reporter thread that fires the
 //     callbacks: per-task first (only on state/progress change, terminal
 //     states reported at the transition tick), then the global callback
-//     (every tick).
+//     (every tick). Callbacks fire on the native reporter thread (sink/commit
+//     callbacks may also fire on a native worker thread).
 //   * strings cross the ABI as UTF-8: string params are encoded via Utf8Bytes
 //     (NUL-terminated byte[]) and returned char* values are read via
 //     PtrToStringUtf8. Never use CharSet.Ansi — on Windows it converts through
@@ -22,14 +23,16 @@
 //     DlmgrDLL wrappers below keep static strong references to every delegate
 //     they register, but user-supplied delegates MUST be static +
 //     [MonoPInvokeCallback(typeof(DlmgrTaskCallback))] on IL2CPP/AOT and stay
-//     referenced for the manager lifetime. Callbacks fire on a native worker
-//     thread — dispatch to the main thread yourself if needed.
+//     referenced for the manager lifetime. Dispatch to the main thread yourself
+//     if needed; never let managed exceptions escape a native callback.
 //   * Sinks: a sink is a u64 handle from a native sink registry (glue bridges
 //     VFS-backed sinks via the Rust sink vtable; DlmgrSinkCreateFile gives
 //     plain-file ones). Release a sink only after its task reported a
 //     terminal state (Done / Failed / Canceled).
 //   * Lifecycle: Create -> (AddDohUrl)* -> Start -> Enqueue* -> Shutdown.
-//     Shutdown consumes the handle (cancel all + join, cannot deadlock).
+//     Successful shutdown consumes the handle (cancel all + join). Shutdown
+//     from ANY native dlmgr worker/reporter thread is rejected without consuming
+//     it; callbacks should use dlmgr_shutdown_try and request external shutdown.
 //     curlw_global_init is the host's responsibility and must be called
 //     before Start.
 //   * Dual-URL semantics (native): range_url is probed with
@@ -134,18 +137,48 @@ namespace NativeBridgeF
             return dlmgr_add_doh_url_imp(mgr, url == null ? null : Utf8Bytes(url));
         }
 
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dlmgr_shutdown")]
-        private static extern void dlmgr_shutdown_imp(IntPtr mgr);
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dlmgr_shutdown_try")]
+        private static extern int dlmgr_shutdown_try_imp(IntPtr mgr);
 
-        // Consumes the handle: cancel all + join threads; do not use afterwards.
-        // The reporter thread is joined before shutdown returns, so no callback
-        // can be in flight when this manager's keep-alive entries are dropped.
+        /// <summary>
+        /// Returns 0 after canceling tasks, joining all threads and consuming the
+        /// handle (IntPtr.Zero is a successful no-op). Returns -1 on ANY dlmgr
+        /// worker/reporter thread, including sink/commit callbacks, without changing
+        /// the manager or releasing callback roots. This also forbids cross-manager
+        /// shutdown from callbacks to prevent join cycles.
+        /// Use this API in callbacks: rejection does not throw. Request shutdown on
+        /// an external thread and return; do not wait for shutdown inside a callback.
+        /// The caller must serialize external shutdown with other handle use,
+        /// including Start and another shutdown. Do not reuse a consumed handle.
+        /// </summary>
+        public static int dlmgr_shutdown_try(IntPtr mgr)
+        {
+            int result = dlmgr_shutdown_try_imp(mgr);
+            if (result == 0)
+            {
+                // Native joins have completed: no callback can still be in flight.
+                // Never hold s_cbLock across the native call (callbacks may re-enter).
+                lock (s_cbLock)
+                {
+                    s_handleCallbacks.Remove(mgr);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Consumes the handle on success; throws InvalidOperationException when
+        /// called from any dlmgr internal thread, leaving the handle and callback
+        /// roots intact. Callbacks MUST use dlmgr_shutdown_try instead so rejection
+        /// cannot throw across the unmanaged boundary.
+        /// </summary>
         public static void dlmgr_shutdown(IntPtr mgr)
         {
-            dlmgr_shutdown_imp(mgr);
-            lock (s_cbLock)
+            if (dlmgr_shutdown_try(mgr) != 0)
             {
-                s_handleCallbacks.Remove(mgr);
+                throw new InvalidOperationException(
+                    "Shutdown is forbidden on dlmgr worker/reporter threads. " +
+                    "Use dlmgr_shutdown_try in callbacks and shut down from an external thread.");
             }
         }
 
@@ -287,6 +320,19 @@ namespace NativeBridgeF
         public static ulong dlvfs_sink_create_for_vfs(IntPtr vfs, string name, ulong size)
         {
             return dlvfs_sink_create_for_vfs(vfs, DlmgrDLL.Utf8Bytes(name ?? ""), size);
+        }
+
+        /// <summary>
+        /// Downloads into the same native VFS owned by reader; does not open a
+        /// second handle or transfer ownership. Keep reader alive and undisposed
+        /// until every sink created from it has been released after task termination.
+        /// After Done, call RefreshIndex and EnsureMapping on this same reader to
+        /// read the committed entry; no close/reopen or flush is needed for visibility.
+        /// </summary>
+        public static ulong dlvfs_sink_create_for_vfs(VfsReader reader, string name, ulong size)
+        {
+            if (reader == null) throw new ArgumentNullException("reader");
+            return dlvfs_sink_create_for_vfs(reader.NativeHandle, name, size);
         }
     }
 }

@@ -1016,8 +1016,22 @@ namespace NativeBridgeF
         public static extern void curlw_free(IntPtr p);
 
         // --- easy: extra entry points ----------------------------------------
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLH curlw_easy_duphandle(CURLH handle);
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_easy_duphandle")]
+        private static extern CURLH curlw_easy_duphandle_imp(CURLH handle);
+
+        public static CURLH curlw_easy_duphandle(CURLH handle)
+        {
+            lock (s_cbLock)
+            {
+                CURLH duplicate = curlw_easy_duphandle_imp(handle);
+                if (duplicate != IntPtr.Zero && s_handleCallbacks.TryGetValue(handle, out var callbacks))
+                {
+                    // libcurl copies callback pointers; give the duplicate its own roots.
+                    s_handleCallbacks[duplicate] = new List<Delegate>(callbacks);
+                }
+                return duplicate;
+            }
+        }
 
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
         public static extern CURLcode curlw_easy_pause(CURLH handle, int action);
@@ -1025,11 +1039,27 @@ namespace NativeBridgeF
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
         public static extern CURLcode curlw_easy_upkeep(CURLH handle);
 
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLcode curlw_easy_recv(CURLH handle, [Out] byte[] buffer, UIntPtr buflen, out UIntPtr n);
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_easy_recv")]
+        private static extern CURLcode curlw_easy_recv_imp(CURLH handle, [Out] byte[] buffer, UIntPtr buflen, out UIntPtr n);
 
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLcode curlw_easy_send(CURLH handle, byte[] buffer, UIntPtr buflen, out UIntPtr n);
+        public static CURLcode curlw_easy_recv(CURLH handle, [Out] byte[] buffer, UIntPtr buflen, out UIntPtr n)
+        {
+            n = UIntPtr.Zero;
+            if (buflen.ToUInt64() > (ulong)(buffer == null ? 0 : buffer.LongLength))
+                return CURLcode.CURLE_BAD_FUNCTION_ARGUMENT;
+            return curlw_easy_recv_imp(handle, buffer, buflen, out n);
+        }
+
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_easy_send")]
+        private static extern CURLcode curlw_easy_send_imp(CURLH handle, byte[] buffer, UIntPtr buflen, out UIntPtr n);
+
+        public static CURLcode curlw_easy_send(CURLH handle, byte[] buffer, UIntPtr buflen, out UIntPtr n)
+        {
+            n = UIntPtr.Zero;
+            if (buflen.ToUInt64() > (ulong)(buffer == null ? 0 : buffer.LongLength))
+                return CURLcode.CURLE_BAD_FUNCTION_ARGUMENT;
+            return curlw_easy_send_imp(handle, buffer, buflen, out n);
+        }
 
         // Returns a curl-allocated string; the managed wrapper copies it and frees
         // the native buffer for you. Input is encoded as UTF-8 (see Utf8Bytes).
@@ -1167,12 +1197,18 @@ namespace NativeBridgeF
             return curlw_mime_name_imp(part, name == null ? null : Utf8Bytes(name));
         }
 
-        // Pass the exact byte length as datasize. Do NOT pass UIntPtr.MaxValue
-        // (curl's CURL_ZERO_TERMINATED): with a byte[] the marshaller does not
-        // append a NUL, so curl's strlen() would read past the array. For NUL-
-        // terminated text use curlw_mime_data with the real length instead.
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLcode curlw_mime_data(IntPtr part, byte[] data, UIntPtr datasize);
+        // Pass the exact byte length as datasize. The bounds check rejects
+        // size_t.MaxValue (CURL_ZERO_TERMINATED) for byte[]: the marshaller does
+        // not append a NUL. Null data clears the part; libcurl ignores its size.
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_mime_data")]
+        private static extern CURLcode curlw_mime_data_imp(IntPtr part, byte[] data, UIntPtr datasize);
+
+        public static CURLcode curlw_mime_data(IntPtr part, byte[] data, UIntPtr datasize)
+        {
+            if (data != null && datasize.ToUInt64() > (ulong)data.LongLength)
+                return CURLcode.CURLE_BAD_FUNCTION_ARGUMENT;
+            return curlw_mime_data_imp(part, data, datasize);
+        }
 
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_mime_filedata")]
         private static extern CURLcode curlw_mime_filedata_imp(IntPtr part, byte[] filename);
@@ -1251,13 +1287,32 @@ namespace NativeBridgeF
         public static string curlw_url_strerror(CURLUcode error) => PtrToStringUtf8(curlw_url_strerror_imp(error));
 
         // --- WebSocket -------------------------------------------------------
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLcode curlw_ws_recv(CURLH handle, [Out] byte[] buffer, UIntPtr buflen,
-                                                    out UIntPtr recv, out IntPtr meta);
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_ws_recv")]
+        private static extern CURLcode curlw_ws_recv_imp(CURLH handle, [Out] byte[] buffer, UIntPtr buflen,
+                                                         out UIntPtr recv, out IntPtr meta);
 
-        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
-        public static extern CURLcode curlw_ws_send(CURLH handle, byte[] buffer, UIntPtr buflen,
-                                                    out UIntPtr sent, long fragsize, uint flags);
+        public static CURLcode curlw_ws_recv(CURLH handle, [Out] byte[] buffer, UIntPtr buflen,
+                                             out UIntPtr recv, out IntPtr meta)
+        {
+            recv = UIntPtr.Zero;
+            meta = IntPtr.Zero;
+            if (buflen.ToUInt64() > (ulong)(buffer == null ? 0 : buffer.LongLength))
+                return CURLcode.CURLE_BAD_FUNCTION_ARGUMENT;
+            return curlw_ws_recv_imp(handle, buffer, buflen, out recv, out meta);
+        }
+
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "curlw_ws_send")]
+        private static extern CURLcode curlw_ws_send_imp(CURLH handle, byte[] buffer, UIntPtr buflen,
+                                                         out UIntPtr sent, long fragsize, uint flags);
+
+        public static CURLcode curlw_ws_send(CURLH handle, byte[] buffer, UIntPtr buflen,
+                                             out UIntPtr sent, long fragsize, uint flags)
+        {
+            sent = UIntPtr.Zero;
+            if (buflen.ToUInt64() > (ulong)(buffer == null ? 0 : buffer.LongLength))
+                return CURLcode.CURLE_BAD_FUNCTION_ARGUMENT;
+            return curlw_ws_send_imp(handle, buffer, buflen, out sent, fragsize, flags);
+        }
 
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr curlw_ws_meta(CURLH handle);

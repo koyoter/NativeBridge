@@ -207,9 +207,10 @@ Foreach ($lib_name in $libs) {
     # compile entirely. Correctness of "current" is guaranteed by the CI cache
     # key, which hashes every input that affects the artifacts (build.yml,
     # patch1.ps1, *.patch, build.ps1, 1k/**); any change misses the cache, leaves
-    # the install dir empty, and forces a full rebuild. -rebuild bypasses this.
+    # the install dir empty, and forces a full rebuild. -rebuild and local source
+    # modules bypass this version-only check.
     $install_dir = Join-Path $install_root $lib_name
-    if (!$rebuild) {
+    if (!$rebuild -and !$is_local) {
         $cached_sentry = Join-Path $install_dir '_1kiss'
         if (Test-Path $cached_sentry -PathType Leaf) {
             $cached_ver = ((Get-Content $cached_sentry -First 1) -replace '^ver:\s*', '').Trim()

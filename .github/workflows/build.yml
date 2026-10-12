@@ -55,6 +55,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -87,6 +88,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -127,6 +129,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -166,6 +169,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -210,6 +214,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -254,6 +259,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -294,6 +300,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -338,6 +345,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -378,6 +386,7 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
+          if-no-files-found: error
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
@@ -418,16 +427,18 @@ jobs:
           ls -d install_* || true
       - name: Assemble NativeBridge package
         shell: bash
-        run: bash pack/dist1.sh "$VERSION"
+        run: bash pack/dist1.sh "$VERSION" --require-all
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:
           name: NativeBridge-${{ env.VERSION }}
+          if-no-files-found: error
           path: ${{ env.NB_DIST_ZIP }}
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
           files: ${{ env.NB_DIST_ZIP }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

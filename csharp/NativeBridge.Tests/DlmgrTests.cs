@@ -188,6 +188,73 @@ namespace NativeBridgeF.Tests
         }
 
         /// <summary>
+        /// Task/global callbacks must reject both self- and cross-manager shutdown,
+        /// including the final callback while external shutdown has taken handles.
+        /// Callback bodies use only the non-throwing try API; assertions stay here.
+        /// </summary>
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShutdownTry_ReporterCallbackRejects_ThenExternalShutdownSucceeds(bool globalCallback)
+        {
+            string dir = TestPaths.NewDir();
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 0, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            ulong sink = 0;
+            int attempts = 0, unexpectedResult = 0;
+            Action attemptShutdown = () =>
+            {
+                int self = DlmgrDLL.dlmgr_shutdown_try(mgr);
+                int other = DlmgrDLL.dlmgr_shutdown_try(_mgr);
+                if (self != -1 || other != -1) Interlocked.Exchange(ref unexpectedResult, 1);
+                Interlocked.Increment(ref attempts);
+            };
+            try
+            {
+                Assert.That(DlmgrDLL.dlmgr_pause(mgr), Is.EqualTo(0));
+                if (globalCallback)
+                {
+                    Assert.That(DlmgrDLL.dlmgr_set_global_callback(mgr,
+                        (user, active, done, failed, bytesDone, bytesTotal, bps) => attemptShutdown(),
+                        IntPtr.Zero), Is.EqualTo(0));
+                }
+                else
+                {
+                    Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr,
+                        (user, id, state, done, total, bps, err) => attemptShutdown(),
+                        IntPtr.Zero), Is.EqualTo(0));
+                }
+                sink = DlmgrDLL.dlmgr_sink_create_file(mgr, Path.Combine(dir, "pending.bin"), 0);
+                Assert.That(sink, Is.Not.EqualTo(0UL));
+                EnqueueLocal(mgr, _server.Add("shutdown-pending.bin", new byte[0]),
+                    "pending.bin", new byte[0], sink);
+                Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+                Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref attempts) > 0, 10_000), Is.True);
+                Assert.That(Volatile.Read(ref unexpectedResult), Is.EqualTo(0));
+                // Both handles still work after the callback's rejected attempts.
+                Assert.That(DlmgrDLL.dlmgr_pause(mgr), Is.EqualTo(0));
+                Assert.That(DlmgrDLL.dlmgr_set_global_speed(_mgr, 0), Is.EqualTo(0));
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                int beforeShutdown = Volatile.Read(ref attempts);
+                int result = DlmgrDLL.dlmgr_shutdown_try(mgr);
+                if (result == 0) mgr = IntPtr.Zero;
+                Assert.That(result, Is.EqualTo(0));
+                Assert.That(Volatile.Read(ref attempts), Is.GreaterThan(beforeShutdown),
+                    "Final callback must still be rooted and reject nested shutdown during join");
+                Assert.That(Volatile.Read(ref unexpectedResult), Is.EqualTo(0));
+            }
+            finally
+            {
+                // Join before releasing even if an assertion/wait failed.
+                if (mgr != IntPtr.Zero) DlmgrDLL.dlmgr_shutdown(mgr);
+                if (sink != 0) DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        /// <summary>
         /// 测试重点：文件 sink 下载全链路——range 源（206 + Content-Range）
         /// 正常下载到本地文件：终态 Done、done/total 等于任务 size、
         /// 文件字节逐字节一致。sink 只能在终态后释放。
@@ -376,6 +443,90 @@ namespace NativeBridgeF.Tests
                 Assert.That(got, Is.EqualTo(data));
             }
             try { Directory.Delete(dir, true); } catch { }
+        }
+
+        /// <summary>
+        /// One reader owns the VFS for downloads AND reads. Commit callbacks run on
+        /// workers and must reject self/cross-manager shutdown without throwing.
+        /// Entries are read through that same reader after terminal, without reopening.
+        /// </summary>
+        [Test]
+        public void DownloadIntoOneReader_CommitShutdownRejected_ThenReadSameInstance()
+        {
+            string dir = TestPaths.NewDir();
+            IntPtr mgr = DlmgrDLL.dlmgr_create(2, 0, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            try
+            {
+                using (var reader = VfsReader.Open(dir))
+                {
+                    var contents = new[] { TestPaths.Content(128 * 1024, 31), TestPaths.Content(256 * 1024, 32) };
+                    var names = new[] { "reader-first.bin", "reader-second.bin" };
+                    var sinks = new ulong[contents.Length];
+                    var ids = new ulong[contents.Length];
+                    int commits = 0, unexpectedResult = 0;
+                    reader.SetCommitCallback((user, name, offset, size, crc) =>
+                    {
+                        int self = DlmgrDLL.dlmgr_shutdown_try(mgr);
+                        int other = DlmgrDLL.dlmgr_shutdown_try(_mgr);
+                        if (self != -1 || other != -1) Interlocked.Exchange(ref unexpectedResult, 1);
+                        Interlocked.Increment(ref commits);
+                    });
+                    try
+                    {
+                        Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+                        reader.RefreshIndex();
+                        Assert.That(reader.Count, Is.EqualTo(0));
+                        // Queue before start: worker callbacks may run before all
+                        // join handles are published, so thread identity must use TLS.
+                        for (int i = 0; i < contents.Length; i++)
+                        {
+                            sinks[i] = DlVfs.dlvfs_sink_create_for_vfs(reader, names[i], (ulong)contents[i].Length);
+                            Assert.That(sinks[i], Is.Not.EqualTo(0UL));
+                            ids[i] = EnqueueLocal(mgr, _server.Add(names[i], contents[i]), names[i], contents[i], sinks[i]);
+                        }
+                        Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+                        WaitAllTerminal(ids, TerminalMs);
+                        Assert.That(Volatile.Read(ref commits), Is.EqualTo(contents.Length));
+                        Assert.That(Volatile.Read(ref unexpectedResult), Is.EqualTo(0));
+                        reader.RefreshIndex();
+                        reader.EnsureMapping();
+                        Assert.That(reader.Count, Is.EqualTo(contents.Length));
+                        for (int i = 0; i < contents.Length; i++)
+                        {
+                            Assert.That(_records[ids[i]].State, Is.EqualTo((int)DlmgrTaskState.Done));
+                            Assert.That(reader.TryGet(names[i], out VfsEntry entry), Is.True);
+                            Assert.That(entry.State, Is.EqualTo(VfsFileState.Active));
+                            Assert.That(entry.Size, Is.EqualTo((ulong)contents[i].Length));
+                            Assert.That(entry.Crc, Is.EqualTo(TestPaths.Crc32(contents[i])));
+                            Assert.That(reader.TryReadBytes(names[i], out byte[] got), Is.True);
+                            Assert.That(got, Is.EqualTo(contents[i]));
+                        }
+                        int result = DlmgrDLL.dlmgr_shutdown_try(mgr);
+                        if (result == 0) mgr = IntPtr.Zero;
+                        Assert.That(result, Is.EqualTo(0));
+                    }
+                    finally
+                    {
+                        // Even on failure, join workers before releasing their sinks;
+                        // the reader owns its handle until ALL sinks are gone.
+                        if (mgr != IntPtr.Zero)
+                        {
+                            DlmgrDLL.dlmgr_shutdown(mgr);
+                            mgr = IntPtr.Zero;
+                        }
+                        foreach (ulong sink in sinks)
+                        {
+                            if (sink != 0) DlmgrDLL.dlmgr_sink_release(sink);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (mgr != IntPtr.Zero) DlmgrDLL.dlmgr_shutdown(mgr);
+                try { Directory.Delete(dir, true); } catch { }
+            }
         }
 
         // --- 并发 / 稳定性 -----------------------------------------------------------
