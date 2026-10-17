@@ -315,3 +315,13 @@ if ($needs_build_std) {
 Write-Host "nativebridge build1: running $cargo_cmd $cargo_args"
 & $cargo_cmd @cargo_args
 if ($LASTEXITCODE -ne 0) { fail "cargo build failed with exit code $LASTEXITCODE" }
+
+# CI hook: NB_RUN_CARGO_TESTS=1 → also run the Rust unit tests on the HOST
+# target (dev profile, plain stable cargo) with the same NB_* link env as the
+# release build above. Test failures fail the build step and gate the release
+# pipeline (see .github/workflows/build.yml rust-test job).
+if ($env:NB_RUN_CARGO_TESTS -eq '1') {
+    Write-Host "nativebridge build1: NB_RUN_CARGO_TESTS=1, running cargo test"
+    & cargo test
+    if ($LASTEXITCODE -ne 0) { fail "cargo test failed with exit code $LASTEXITCODE" }
+}

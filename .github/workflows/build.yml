@@ -16,7 +16,56 @@ env:
   VS_DEPLOYMENT_TARGET: 10.0.17763.0
 
 jobs:
+  # Rust unit tests on the two native-tested platforms, gated BEFORE the
+  # multi-platform build matrix: a test failure skips the whole build +
+  # release chain. Reuses the same dependency cache keys as the build jobs,
+  # so the C deps compiled here are shared with the win32/osx build jobs.
+  rust-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: win32
+            arch: x64
+            runner: windows-latest
+          - os: osx
+            arch: arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      INSTALL_PATH: install_${{ matrix.os }}_${{ matrix.arch }}
+      NB_RUN_CARGO_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependency libraries
+        uses: actions/cache@v4
+        with:
+          path: ./${{ env.INSTALL_PATH }}
+          key: nbdeps-${{ env.INSTALL_PATH }}-${{ hashFiles('build.ps1', '1k/**', 'deps/**') }}
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: nbcargo-${{ runner.os }}-${{ hashFiles('native/Cargo.toml', 'native/Cargo.lock') }}
+          restore-keys: |
+            nbcargo-${{ runner.os }}-
+      - name: Setup Python
+        if: matrix.os == 'osx'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Force nativebridge rebuild (keep cached deps)
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./${{ env.INSTALL_PATH }}/nativebridge"
+      - name: Build & run Rust tests
+        shell: pwsh
+        run: ./build.ps1 -p ${{ matrix.os }} -a ${{ matrix.arch }}
+
   win32:
+    needs: rust-test
     runs-on: windows-latest
     strategy:
       matrix:
@@ -60,6 +109,7 @@ jobs:
           name: ${{ env.install_path }}
 
   win32-arm64:
+    needs: rust-test
     runs-on: windows-11-arm
     env:
       INSTALL_PATH: install_win32_arm64
@@ -93,6 +143,7 @@ jobs:
           name: ${{ env.install_path }}
 
   linux:
+    needs: rust-test
     strategy:
       matrix:
         include:
@@ -134,6 +185,7 @@ jobs:
           name: ${{ env.install_path }}
 
   android:
+    needs: rust-test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -174,6 +226,7 @@ jobs:
           name: ${{ env.install_path }}
 
   osx:
+    needs: rust-test
     strategy:
       matrix:
         include:
@@ -219,6 +272,7 @@ jobs:
           name: ${{ env.install_path }}
 
   ios:
+    needs: rust-test
     runs-on: macos-15
     strategy:
       matrix:
@@ -264,6 +318,7 @@ jobs:
           name: ${{ env.install_path }}
 
   ios-arm64-sim:
+    needs: rust-test
     runs-on: macos-15
     env:
       INSTALL_PATH: install_ios_arm64_sim
@@ -305,6 +360,7 @@ jobs:
           name: ${{ env.install_path }}
 
   tvos:
+    needs: rust-test
     runs-on: macos-15
     strategy:
       matrix:
@@ -350,6 +406,7 @@ jobs:
           name: ${{ env.install_path }}
 
   tvos-arm64-sim:
+    needs: rust-test
     runs-on: macos-15
     env:
       INSTALL_PATH: install_tvos_arm64_sim
@@ -390,10 +447,61 @@ jobs:
           path: ./${{ env.install_path }}/**
           name: ${{ env.install_path }}
 
+  # C# NUnit tests against the freshly built native libraries, gated BEFORE
+  # dist: the tests feed off the build artifacts (not the zip), and a failure
+  # here blocks the release from being assembled/published.
+  csharp-test-win:
+    needs: win32
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download native library artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: install_win32_x64
+          path: _nb
+      - name: Place native library for the test project
+        shell: pwsh
+        run: |
+          $dst = "csharp/NativeBridge.Tests/native/Plugins/Windows/x86_64"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item "_nb/nativebridge/bin/NativeBridge.dll" "$dst/NativeBridge.dll"
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Run C# tests
+        shell: pwsh
+        run: dotnet test csharp/NativeBridge.Tests/NativeBridge.Tests.csproj -c Release --nologo
+
+  csharp-test-mac:
+    needs: osx
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download native library artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: install_osx_arm64
+          path: _nb
+      - name: Place native library for the test project
+        shell: bash
+        run: |
+          mkdir -p csharp/NativeBridge.Tests/native/Plugins/macOS
+          cp _nb/nativebridge/lib/libNativeBridge.dylib \
+             csharp/NativeBridge.Tests/native/Plugins/macOS/NativeBridge.dylib
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Run C# tests
+        shell: bash
+        run: dotnet test csharp/NativeBridge.Tests/NativeBridge.Tests.csproj -c Release --nologo
+
   # Assemble the Unity package from all platform artifacts and publish it to
   # the pushed tag's release.
   dist:
-    needs: [win32, win32-arm64, linux, android, osx, ios, ios-arm64-sim, tvos, tvos-arm64-sim]
+    needs: [win32, win32-arm64, linux, android, osx, ios, ios-arm64-sim, tvos, tvos-arm64-sim, csharp-test-win, csharp-test-mac]
     runs-on: macos-latest  # needs lipo + xcodebuild for the xcframework
     permissions:
       contents: write
