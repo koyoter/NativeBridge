@@ -637,8 +637,11 @@ fn compact_twice_with_reopen() {
 
 // --- 本轮评审回归 ---
 
+/// slot_cap 新格式：等长、不同 framing 的槽按容量安全复用——覆写内容不改变
+/// 走槽长度（cap），撕裂写也不会错位后续槽位；旧格式（按内容长度走槽）才
+/// 依赖 framing 不变（cap=0 的旧格式槽仍走 Twin 路径的 framing 相同检查）。
 #[test]
-fn equal_size_slots_with_different_framing_are_not_reused() {
+fn equal_size_slots_with_different_framing_are_capacity_reused() {
     let td = TempDir::new();
     let v = Vfs::open(&td.0).unwrap();
     let old = v.alloc(&"x".repeat(37), 0).unwrap();
@@ -656,20 +659,20 @@ fn equal_size_slots_with_different_framing_are_not_reused() {
     let before = fs::read(&hp).unwrap();
     v.flush().unwrap();
     let after = fs::read(&hp).unwrap();
-    let start = old_slot.off as usize;
-    let end = start + old_slot.len as usize;
-    assert_eq!(&after[start..end], &before[start..end]);
-    assert!(after.len() > before.len());
+    // 新内容（2 条目 + "a/bbb" 名字）与该槽等长、framing 不同 → 按容量原位
+    // 复用，header 不再增长。
+    assert_eq!(after.len(), before.len());
     drop(v);
     let reopened = Vfs::open(&td.0).unwrap();
     assert_eq!(reopened.lookup("a").unwrap().state, ST_ACTIVE);
     assert_eq!(reopened.lookup("bbb").unwrap().state, ST_ACTIVE);
 }
 
-/// R05：更小的 region 不得复用更大的闲置槽位——死尾巴会卡死重开时的顺序扫描，
-/// 其后追加的槽位全部不可达（gen 回退、新文件消失）。
+/// R05 演化：更小的 region 复用更大的槽位后，槽内出现死尾巴——旧格式按内容
+/// 长度走槽会被死尾卡死（其后槽位不可达）；slot_cap 新格式按容量走槽，重开
+/// 扫描必须仍然可达、内容一致。
 #[test]
-fn persist_never_reuses_larger_inactive_slot() {
+fn smaller_region_reuses_larger_slot_and_reopen_stays_reachable() {
     let td = TempDir::new();
     {
         let v = Vfs::open(&td.0).unwrap();
@@ -848,7 +851,8 @@ fn flush_reuses_bigger_free_slot_instead_of_growing_header() {
     }
     let v = Vfs::open(&td.0).unwrap();
     assert!(v.lookup("a").is_ok());
-    assert!(v.lookup("b").is_err()); // Deleted 不复活
+    // lookup 对 Deleted 条目返回 Ok（带 state）——断言 b 已成 Deleted 而非 Active。
+    assert_eq!(v.lookup("b").unwrap().state, ST_DELETED);
 }
 
 #[test]
