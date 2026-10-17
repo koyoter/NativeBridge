@@ -6,6 +6,10 @@ Unity / C# 用的自包含原生库：静态链接 curl HTTP/1.1 + HTTP/2 + HTTP
 配套 C# 封装与 NUnit 测试。从 [1kiss](https://github.com/simdsoft/1kiss) 工程独立而来，
 构建机器（`1k/`）vendored 自上游。
 
+dlmgr 下载默认由 curl 协商（HTTP/1.1/2），`dlmgr_set_http_version` 可强制 HTTP/3
+（`30` 失败自动回退 h2，`31` 不回退；需服务器 Alt-Svc/QUIC 支持）。移动端
+BoringSSL 无系统 CA 信任库，HTTPS 须先 `dlmgr_set_ca_blob` 喂 PEM bundle。
+
 ## Layout
 
 ```

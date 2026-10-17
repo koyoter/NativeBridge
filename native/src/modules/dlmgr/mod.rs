@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -90,6 +90,11 @@ pub(crate) struct Shared {
     worker_count: u32,
     share: SendPtr, // *mut CURLSH（DNS 共享）
     doh: Mutex<Option<String>>,
+    /// CA 证书 bundle（PEM）：worker 建柄时快照进 CURLOPT_CAINFO_BLOB。
+    /// 移动端 BoringSSL 无编译期默认 CA 路径，不设则 HTTPS 握手必败。
+    ca_blob: Mutex<Option<Vec<u8>>>,
+    /// CURLOPT_HTTP_VERSION 透传值（0 = curl 默认协商）；worker 建柄时快照。
+    http_version: AtomicI64,
     task_cb: Mutex<Option<(DlmgrTaskCb, SendPtr)>>,
     global_cb: Mutex<Option<(DlmgrGlobalCb, SendPtr)>>,
     reporter_stop: AtomicBool,
@@ -121,6 +126,8 @@ impl Shared {
             worker_count: worker_count.clamp(1, 64),
             share: SendPtr(share),
             doh: Mutex::new(None),
+            ca_blob: Mutex::new(None),
+            http_version: AtomicI64::new(0),
             task_cb: Mutex::new(None),
             global_cb: Mutex::new(None),
             reporter_stop: AtomicBool::new(false),
@@ -267,6 +274,36 @@ pub unsafe extern "C" fn dlmgr_add_doh_url(mgr: *mut c_void, url: *const c_char)
     }
     *sh.doh.lock().unwrap() = Some(url);
     0
+}
+
+/// 设置 CA 证书 bundle（PEM 或 DER 拼接；CURLOPT_CAINFO_BLOB 透传）。
+/// worker 建柄时一次性快照，须在 Start 前调用；重复调用以最后一条为准。
+/// data=NULL/len=0 清空。返回 0 成功，-1 参数错（mgr 无效）。
+/// 移动端（iOS/Android/tvOS）BoringSSL 无编译期默认 CA 路径，HTTPS 必须显式设置。
+#[no_mangle]
+pub unsafe extern "C" fn dlmgr_set_ca_blob(mgr: *mut c_void, data: *const u8, len: usize) -> i32 {
+    let Some(sh) = shared(mgr) else { return -1 };
+    if data.is_null() || len == 0 {
+        *sh.ca_blob.lock().unwrap() = None;
+        return 0;
+    }
+    *sh.ca_blob.lock().unwrap() = Some(std::slice::from_raw_parts(data, len).to_vec());
+    0
+}
+
+/// 设置 HTTP 协议版本（CURLOPT_HTTP_VERSION 透传）：0=curl 默认协商、1=1.0、
+/// 2=1.1、3=2.0、4=2TLS、5=2 PriorKnowledge、30=3（失败回退）、31=3ONLY。
+/// worker 建柄时一次性快照，须在 Start 前调用。返回 0 成功，-1 参数错。
+#[no_mangle]
+pub unsafe extern "C" fn dlmgr_set_http_version(mgr: *mut c_void, version: i64) -> i32 {
+    let Some(sh) = shared(mgr) else { return -1 };
+    match version {
+        0 | 1 | 2 | 3 | 4 | 5 | 30 | 31 => {
+            sh.http_version.store(version, Ordering::Relaxed);
+            0
+        }
+        _ => -1,
+    }
 }
 
 /// 启动 worker 池 + reporter 线程（幂等）。curlw_global_init 由宿主负责，dlmgr 不调用。

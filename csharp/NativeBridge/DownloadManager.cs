@@ -29,12 +29,12 @@
 //     VFS-backed sinks via the Rust sink vtable; DlmgrSinkCreateFile gives
 //     plain-file ones). Release a sink only after its task reported a
 //     terminal state (Done / Failed / Canceled).
-//   * Lifecycle: Create -> (AddDohUrl)* -> Start -> Enqueue* -> Shutdown.
-//     Successful shutdown consumes the handle (cancel all + join). Shutdown
-//     from ANY native dlmgr worker/reporter thread is rejected without consuming
-//     it; callbacks should use dlmgr_shutdown_try and request external shutdown.
-//     curlw_global_init is the host's responsibility and must be called
-//     before Start.
+//   * Lifecycle: Create -> (SetCaBlob | SetHttpVersion | AddDohUrl)* -> Start ->
+//     Enqueue* -> Shutdown. Successful shutdown consumes the handle (cancel all
+//     + join). Shutdown from ANY native dlmgr worker/reporter thread is rejected
+//     without consuming it; callbacks should use dlmgr_shutdown_try and request
+//     external shutdown. curlw_global_init is the host's responsibility and must
+//     be called before Create (dlmgr_create internally calls curl_share_init).
 //   * Dual-URL semantics (native): range_url is probed with
 //     "Range: bytes=0-"; a non-206 answer, Content-Range total mismatch or
 //     crc mismatch switches the task to full_url from zero ONCE (not
@@ -72,6 +72,22 @@ namespace NativeBridgeF
         Network = 4,
         Timeout = 5,
         Canceled = 6,
+        Busy = 7,
+    }
+
+    // CURLOPT_HTTP_VERSION passthrough values (mirror curl.h). None = curl
+    // negotiates; V3 prefers HTTP/3 with fallback, V3Only never falls back
+    // (needs server Alt-Svc/QUIC support).
+    public enum CurlHttpVersion
+    {
+        None = 0,
+        V10 = 1,
+        V11 = 2,
+        V2 = 3,
+        V2Tls = 4,
+        V2PriorKnowledge = 5,
+        V3 = 30,
+        V3Only = 31,
     }
 
     // --- callbacks ---------------------------------------------------------------
@@ -135,6 +151,29 @@ namespace NativeBridgeF
         public static int dlmgr_add_doh_url(IntPtr mgr, string url)
         {
             return dlmgr_add_doh_url_imp(mgr, url == null ? null : Utf8Bytes(url));
+        }
+
+        // CA certificate bundle (PEM) for CURLOPT_CAINFO_BLOB. The BoringSSL
+        // build has no compiled-in default CA path, so on iOS/Android/tvOS HTTPS
+        // fails the handshake unless the host supplies one (e.g. read a PEM from
+        // StreamingAssets and pass its bytes). Snapshotted when workers are
+        // created — apply before Start; passing null clears it.
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dlmgr_set_ca_blob(IntPtr mgr, byte[] data, UIntPtr len);
+
+        public static int dlmgr_set_ca_blob(IntPtr mgr, byte[] ca)
+        {
+            return dlmgr_set_ca_blob(mgr, ca, (UIntPtr)(ca?.LongLength ?? 0));
+        }
+
+        // CURLOPT_HTTP_VERSION passthrough (see CurlHttpVersion). Snapshotted
+        // when workers are created — apply before Start. 0 = curl default.
+        [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dlmgr_set_http_version(IntPtr mgr, long version);
+
+        public static int dlmgr_set_http_version(IntPtr mgr, CurlHttpVersion version)
+        {
+            return dlmgr_set_http_version(mgr, (long)version);
         }
 
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dlmgr_shutdown_try")]
@@ -297,8 +336,10 @@ namespace NativeBridgeF
 
     /// <summary>
     /// glue-layer binding: download-into-VFS sink (bridges dlmgr's sink vtable
-    /// to a VFS writer; see modules/glue.rs). The vfs handle must stay open
-    /// (no vfs_close) for the whole lifetime of every sink created from it.
+    /// to a VFS writer; see modules/glue.rs). The native sink holds its own
+    /// reference to the VFS, so an early vfs_close/Dispose no longer invalidates
+    /// it; still, keep the reader/handle alive as good practice until every sink
+    /// created from it has been released after task termination.
     /// </summary>
     public static class DlVfs
     {
@@ -308,8 +349,9 @@ namespace NativeBridgeF
         public const string LIBNAME = "NativeBridge";
 #endif
 
-        // Creates a sink that downloads `name` (size in bytes, enforced at
-        // prepare time) into the VFS `vfs` (handle from VfsDLL.vfs_open).
+        // Creates a sink that downloads `name` into the VFS `vfs` (handle from
+        // VfsDLL.vfs_open). `size` is ignored (ABI placeholder); the task's size
+        // is enforced by the sink's prepare when the download starts.
         // Returns a u64 sink handle for dlmgr_enqueue, 0 on failure. Release it
         // with DlmgrDLL.dlmgr_sink_release after the task's terminal state;
         // on finish the VFS entry is committed (visible immediately to readers).

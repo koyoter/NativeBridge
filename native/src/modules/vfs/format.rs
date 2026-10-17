@@ -4,8 +4,9 @@
 //   SuperBlock: magic[8]="1KVFSHDR" | format_version u32 | active_gen u64 | sb_crc u32 | reserved
 //               （sb_crc 覆盖 magic+version+active_gen 共 20 字节）
 //   Region 头(32B): gen u64 | entry_count u32 | string_area_len u32 | region_crc u32
-//                   | logical_size u64 | reserved u32
-//               （region_crc 覆盖 EntryTable + StringArea）
+//                   | logical_size u64 | slot_cap u32
+//               （region_crc 覆盖 EntryTable + StringArea；slot_cap=0 表示旧格式
+//                 槽——只能按 framing 自算长度走槽；非零=槽容量，可复用更大的槽）
 //   Entry(32B): name_off u32 | name_len u16 | state u8 | reserved u8
 //               | offset u64 | size u64 | crc32 u32 | entry_crc u32
 //               （entry_crc 覆盖前 28 字节）
@@ -159,7 +160,8 @@ pub(crate) fn build_region(
     bytes.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes()); // region_crc 占位
     bytes.extend_from_slice(&logical.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    // slot_cap：全新槽容量 = 内容长度（persist 复用更大空闲槽时会覆写此字段）。
+    bytes.extend_from_slice(&((REGION_HDR_SIZE + table_len + blob.len()) as u32).to_le_bytes());
     for e in entries.iter() {
         let mut cell = [0u8; ENTRY_SIZE];
         e.encode(&mut cell);
@@ -180,11 +182,14 @@ pub(crate) struct ParsedRegion {
 }
 
 /// 扫描 header.vfs 中 off 处的一个 region 槽位。
-/// 返回 None = 头部不可读（后续槽位无法定位，扫描终止）；
+/// `total` = 走槽长度（slot_cap 可信时为槽容量，否则按 framing 自算内容长度）；
+/// `cap` = 槽容量（0 = 旧格式槽，容量未知，只能等长复用）。
+/// 返回 None = 无法定位槽尾（后续槽位无法定位，扫描终止）；
 /// parsed = None = 头部可读但数据校验失败（槽位仍可作为复用空间）。
 pub(crate) struct SlotScan {
     pub(crate) off: u64,
     pub(crate) total: u64,
+    pub(crate) cap: u64,
     pub(crate) parsed: Option<ParsedRegion>,
 }
 
@@ -198,70 +203,88 @@ pub(crate) fn scan_slot(bytes: &[u8], off: usize) -> Option<SlotScan> {
     let str_len = u32::from_le_bytes(h[12..16].try_into().ok()?) as usize;
     let region_crc = u32::from_le_bytes(h[16..20].try_into().ok()?);
     let logical = u64::from_le_bytes(h[20..28].try_into().ok()?);
+    let slot_cap = u32::from_le_bytes(h[28..32].try_into().ok()?) as u64;
     // 头部合理性：防止把垃圾字节当成巨大 region。
-    if count > 1 << 24 || str_len > 1 << 30 {
+    let framing_ok = count <= 1 << 24 && str_len <= 1 << 30;
+    let content = if framing_ok {
+        REGION_HDR_SIZE
+            .checked_add(count.checked_mul(ENTRY_SIZE)?)?
+            .checked_add(str_len)?
+    } else {
+        0
+    };
+    // 走槽长度：slot_cap 非零且落在文件内 → 按槽容量前进——内容被撕裂覆写
+    // （capacity 复用中途断电）或 framing 成垃圾都不影响定位后续槽位；
+    // 否则按 framing 自算长度前进（旧格式槽 / 容量字段不可信）。
+    let cap_usable = slot_cap >= REGION_HDR_SIZE as u64
+        && off.checked_add(slot_cap as usize)? <= bytes.len()
+        && (!framing_ok || slot_cap >= content as u64);
+    let total = if cap_usable {
+        slot_cap as usize
+    } else if framing_ok && off.checked_add(content)? <= bytes.len() {
+        content
+    } else {
         return None;
-    }
-    let table_len = count.checked_mul(ENTRY_SIZE)?;
-    let total = REGION_HDR_SIZE
-        .checked_add(table_len)?
-        .checked_add(str_len)?;
-    let end = off.checked_add(total)?;
-    if end > bytes.len() {
-        return None;
-    }
+    };
     let body_off = off + REGION_HDR_SIZE;
-    let table = &bytes[body_off..body_off + table_len];
-    let names = &bytes[body_off + table_len..end];
     let mut parsed = None;
-    if crc32(&bytes[body_off..end]) == region_crc {
-        let mut entries = Vec::with_capacity(count);
-        let mut ok = true;
-        for cell in table.chunks_exact(ENTRY_SIZE) {
-            match Entry::decode(cell) {
-                Some(e) => {
-                    let s = e.name_off as usize;
-                    let l = e.name_len as usize;
-                    if s + l + 1 > names.len() || std::str::from_utf8(&names[s..s + l]).is_err() {
+    if framing_ok {
+        let table_len = count * ENTRY_SIZE;
+        let end = body_off + table_len + str_len;
+        let table = &bytes[body_off..body_off + table_len];
+        let names = &bytes[body_off + table_len..end];
+        if crc32(&bytes[body_off..end]) == region_crc {
+            let mut entries = Vec::with_capacity(count);
+            let mut ok = true;
+            for cell in table.chunks_exact(ENTRY_SIZE) {
+                match Entry::decode(cell) {
+                    Some(e) => {
+                        let s = e.name_off as usize;
+                        let l = e.name_len as usize;
+                        if s + l + 1 > names.len()
+                            || std::str::from_utf8(&names[s..s + l]).is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                        entries.push(e);
+                    }
+                    None => {
                         ok = false;
                         break;
                     }
-                    entries.push(e);
-                }
-                None => {
-                    ok = false;
-                    break;
                 }
             }
-        }
-        let mut extents = Vec::with_capacity(entries.len());
-        for e in &entries {
-            let end = checked_align4k(e.size).and_then(|a| e.offset.checked_add(a));
-            match end {
-                Some(end) if e.offset % ALIGN == 0 && end <= logical => {
-                    if end > e.offset {
-                        extents.push((e.offset, end));
+            let mut extents = Vec::with_capacity(entries.len());
+            for e in &entries {
+                let end = checked_align4k(e.size).and_then(|a| e.offset.checked_add(a));
+                match end {
+                    Some(end) if e.offset % ALIGN == 0 && end <= logical => {
+                        if end > e.offset {
+                            extents.push((e.offset, end));
+                        }
                     }
+                    _ => ok = false,
                 }
-                _ => ok = false,
             }
-        }
-        extents.sort_unstable();
-        if logical % ALIGN != 0 || extents.windows(2).any(|w| w[0].1 > w[1].0) {
-            ok = false;
-        }
-        if ok {
-            parsed = Some(ParsedRegion {
-                gen,
-                logical,
-                entries,
-                names: names.to_vec(),
-            });
+            extents.sort_unstable();
+            if logical % ALIGN != 0 || extents.windows(2).any(|w| w[0].1 > w[1].0) {
+                ok = false;
+            }
+            if ok {
+                parsed = Some(ParsedRegion {
+                    gen,
+                    logical,
+                    entries,
+                    names: names.to_vec(),
+                });
+            }
         }
     }
     Some(SlotScan {
         off: off as u64,
         total: total as u64,
+        cap: if cap_usable { slot_cap } else { 0 },
         parsed,
     })
 }

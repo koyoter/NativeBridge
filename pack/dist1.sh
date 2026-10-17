@@ -7,7 +7,7 @@
 #
 # Produces:
 #   NativeBridge/                     (Unity package tree, see below)
-#   NativeBridge-CSharpe-<version>.zip
+#   NativeBridge-<version>.zip
 #
 # Expected inputs (any missing platform is skipped with a warning):
 #   install_win32_x64/nativebridge/bin/NativeBridge.dll

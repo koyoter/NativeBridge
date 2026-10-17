@@ -11,7 +11,7 @@ use libc::{c_char, c_void};
 
 use crate::modules::curlw::{
     curlw_easy_cleanup, curlw_easy_getinfo_long, curlw_easy_header, curlw_easy_init,
-    curlw_easy_perform, curlw_easy_setopt_long, curlw_easy_setopt_pointer,
+    curlw_easy_perform, curlw_easy_setopt_blob, curlw_easy_setopt_long, curlw_easy_setopt_pointer,
     curlw_easy_setopt_string, curlw_header_value, curlw_slist_append, curlw_slist_free_all,
 };
 
@@ -26,6 +26,11 @@ pub(crate) const CURLOPT_LOW_SPEED_LIMIT: i32 = 19;
 pub(crate) const CURLOPT_LOW_SPEED_TIME: i32 = 20;
 pub(crate) const CURLOPT_CONNECTTIMEOUT_MS: i32 = 156;
 pub(crate) const CURLOPT_DOH_URL: i32 = 10279;
+pub(crate) const CURLOPT_FOLLOWLOCATION: i32 = 52;
+pub(crate) const CURLOPT_MAXREDIRS: i32 = 68;
+pub(crate) const CURLOPT_HTTP_VERSION: i32 = 84;
+pub(crate) const CURLOPT_CAINFO_BLOB: i32 = 40309; // CURLOPTTYPE_BLOB + 309
+const CURLBLOB_COPY: u32 = 1; // curl 在 setopt 内拷贝数据，调用后 slice 即可释放
 
 pub(crate) const CURLINFO_RESPONSE_CODE: i32 = 0x20_0002; // CURLINFO_LONG + 2
 pub(crate) const CURLINFO_CONTENT_LENGTH_DOWNLOAD_T: i32 = 0x60_000F; // CURLINFO_OFF_T + 15
@@ -52,7 +57,15 @@ pub(crate) struct Easy {
 }
 
 impl Easy {
-    pub(crate) fn new_configured(share: *mut c_void, doh: Option<&str>) -> Option<Easy> {
+    /// `ca`：PEM 证书 bundle（移动端 BoringSSL 无系统信任库，必须显式喂）。
+    /// `http_version`：0 = curl 默认协商，否则透传 CURL_HTTP_VERSION_* 原值。
+    /// 均为 worker 建柄时一次性快照（Start 前设置生效）。
+    pub(crate) fn new_configured(
+        share: *mut c_void,
+        doh: Option<&str>,
+        ca: Option<&[u8]>,
+        http_version: i64,
+    ) -> Option<Easy> {
         let h = unsafe { curlw_easy_init() };
         if h.is_null() {
             return None;
@@ -64,9 +77,32 @@ impl Easy {
                 || curlw_easy_setopt_long(h, CURLOPT_CONNECTTIMEOUT_MS, CONNECT_TIMEOUT_MS) != CURLE_OK
                 || curlw_easy_setopt_long(h, CURLOPT_LOW_SPEED_LIMIT, STALL_LOW_SPEED_LIMIT) != CURLE_OK
                 || curlw_easy_setopt_long(h, CURLOPT_LOW_SPEED_TIME, STALL_LOW_SPEED_TIME) != CURLE_OK
+                // CDN 签名 302 是下载场景常态；不跟随会让 range 探测/兜底全链路
+                // 以误导性的 NETWORK 失败收场。上限 8 跳足够。
+                || curlw_easy_setopt_long(h, CURLOPT_FOLLOWLOCATION, 1) != CURLE_OK
+                || curlw_easy_setopt_long(h, CURLOPT_MAXREDIRS, 8) != CURLE_OK
             {
                 e.cleanup();
                 return None;
+            }
+            if http_version != 0
+                && curlw_easy_setopt_long(h, CURLOPT_HTTP_VERSION, http_version) != CURLE_OK
+            {
+                e.cleanup();
+                return None;
+            }
+            if let Some(ca) = ca {
+                if curlw_easy_setopt_blob(
+                    h,
+                    CURLOPT_CAINFO_BLOB,
+                    ca.as_ptr() as *mut c_void,
+                    ca.len(),
+                    CURLBLOB_COPY,
+                ) != CURLE_OK
+                {
+                    e.cleanup();
+                    return None;
+                }
             }
         }
         if let Some(u) = doh {

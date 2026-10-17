@@ -12,7 +12,7 @@ use super::curlw_backend::{Easy, HeaderList, WriteCb, CURLE_FAILED_INIT, CURLINF
 use super::rate::{SpeedLimiter, TokenBucket};
 use super::sink::{sink_lookup, SinkVTable};
 use super::task::{
-    crc32_update, TaskShared, ERR_CANCELED, ERR_CRC_MISMATCH, ERR_NETWORK, ERR_OK,
+    crc32_update, TaskShared, ERR_BUSY, ERR_CANCELED, ERR_CRC_MISMATCH, ERR_NETWORK, ERR_OK,
     ERR_SIZE_MISMATCH, ERR_TIMEOUT, ERR_UNSUPPORTED_RANGE, TASK_CANCELED, TASK_DONE, TASK_FAILED,
     TASK_RUNNING, TASK_VERIFYING,
 };
@@ -249,14 +249,17 @@ fn backoff_wait(task: &TaskShared, retry_no: u32) -> bool {
 pub(crate) fn spawn(sh: &Arc<Shared>) {
     let share = SendPtr(sh.share.0);
     let doh = sh.doh.lock().unwrap().clone();
+    let ca = sh.ca_blob.lock().unwrap().clone();
+    let http_version = sh.http_version.load(Ordering::Relaxed);
     let count = sh.worker_count;
     let mut handles = sh.workers.lock().unwrap();
     for _ in 0..count {
         let s = sh.clone();
         let doh = doh.clone();
+        let ca = ca.clone();
         if let Ok(h) = std::thread::Builder::new()
             .name("dlmgr-worker".into())
-            .spawn(move || worker_loop(s, share, doh.as_deref()))
+            .spawn(move || worker_loop(s, share, doh.as_deref(), ca.as_deref(), http_version))
         {
             handles.push(h);
         }
@@ -282,9 +285,9 @@ fn take_task(sh: &Shared) -> Option<Arc<TaskShared>> {
     }
 }
 
-fn worker_loop(sh: Arc<Shared>, share: SendPtr, doh: Option<&str>) {
+fn worker_loop(sh: Arc<Shared>, share: SendPtr, doh: Option<&str>, ca: Option<&[u8]>, http_version: i64) {
     let _thread_guard = super::InternalThreadGuard::enter(&sh);
-    let easy = Easy::new_configured(share.0, doh);
+    let easy = Easy::new_configured(share.0, doh, ca, http_version);
     while let Some(task) = take_task(&sh) {
         match easy.as_ref() {
             Some(e) => run_task(&sh, e, &task),
@@ -321,9 +324,28 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
         terminal(task, false, ERR_NETWORK); // sink 已被释放
         return;
     };
-    if unsafe { (vt.prepare)(vt.ctx, task.size) } != 0 {
+    // prepare 失败分流：整理中（vfs BusyCompacting=4）退避重试而非终态——宿主
+    // "入队 → active_count==0 → 整理"的时序会让排队任务撞上整理窗口，此前一律
+    // 折成 NETWORK 冤死且错误码误导；重试仍整理中 → ERR_BUSY。
+    const PREPARE_BUSY: i32 = 4; // VfsError::BusyCompacting.as_i32()（sink vtable 透传）
+    let mut rc = unsafe { (vt.prepare)(vt.ctx, task.size) };
+    if rc == PREPARE_BUSY {
+        for wait in [1_000u64, 2_000, 4_000] {
+            if task.cancel.load(Ordering::Relaxed) {
+                unsafe { (vt.abort)(vt.ctx) };
+                terminal(task, true, ERR_CANCELED);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(wait));
+            rc = unsafe { (vt.prepare)(vt.ctx, task.size) };
+            if rc != PREPARE_BUSY {
+                break;
+            }
+        }
+    }
+    if rc != 0 {
         unsafe { (vt.abort)(vt.ctx) };
-        terminal(task, false, ERR_NETWORK);
+        terminal(task, false, if rc == PREPARE_BUSY { ERR_BUSY } else { ERR_NETWORK });
         return;
     }
 

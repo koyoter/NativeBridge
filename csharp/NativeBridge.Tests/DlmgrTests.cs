@@ -5,6 +5,10 @@
 // dual-URL 回退语义（range 源不支持 Range → 切 full 源）、crc 闸失败、
 // 运行中取消、以及 dlmgr + VFS sink 的端到端胶水（T6 场景）。
 //
+// 已知 e2e 缺口：真 TLS + CA blob 握手链路无人覆盖——HttpTestServer 为纯 HTTP，
+// dlmgr_set_ca_blob 仅参数级验证；"喂 CA 后真 HTTPS 下载成功"需真 URL 或本地
+// TLS 服务器实测（审查报告 P1-1 的遗留建议，改码前后均未执行过）。
+//
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -291,6 +295,65 @@ namespace NativeBridgeF.Tests
             {
                 try { Directory.Delete(outDir, true); } catch { }
             }
+        }
+
+        /// <summary>
+        /// 测试重点：dlmgr_set_http_version 参数校验——合法透传值返回 0，
+        /// 非法值与无效 mgr 返回 -1（不产生可观察副作用，纯 API 面）。
+        /// </summary>
+        [Test]
+        public void SetHttpVersion_ArgValidation()
+        {
+            foreach (var v in new[] { CurlHttpVersion.None, CurlHttpVersion.V10,
+                                      CurlHttpVersion.V11, CurlHttpVersion.V2,
+                                      CurlHttpVersion.V2Tls, CurlHttpVersion.V2PriorKnowledge,
+                                      CurlHttpVersion.V3, CurlHttpVersion.V3Only })
+            {
+                Assert.That(DlmgrDLL.dlmgr_set_http_version(_mgr, v), Is.EqualTo(0), "v=" + v);
+            }
+            Assert.That(DlmgrDLL.dlmgr_set_http_version(_mgr, (CurlHttpVersion)7), Is.EqualTo(-1));
+            Assert.That(DlmgrDLL.dlmgr_set_http_version(_mgr, (CurlHttpVersion)(-1)), Is.EqualTo(-1));
+            Assert.That(DlmgrDLL.dlmgr_set_http_version(IntPtr.Zero, CurlHttpVersion.V11), Is.EqualTo(-1));
+        }
+
+        /// <summary>
+        /// 测试重点：版本须在 Start 前设置（worker 建柄时快照）——夹具的 _mgr 已
+        /// 启动，这里自建管理器走完整 Create → SetHttpVersion → Start → 下载链，
+        /// 证明 setopt 路径可用且不破坏普通 HTTP 下载。
+        /// </summary>
+        [Test]
+        public void SetHttpVersion_V11_DownloadStillWorks()
+        {
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 0, 2);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero), "dlmgr_create 失败");
+            try
+            {
+                Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+                Assert.That(DlmgrDLL.dlmgr_set_http_version(mgr, CurlHttpVersion.V11), Is.EqualTo(0));
+                Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+                var saved = _mgr; // 复用 DownloadToFileSink_Roundtrip 的完整断言链
+                _mgr = mgr;
+                try { DownloadToFileSink_Roundtrip(); }
+                finally { _mgr = saved; }
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：dlmgr_set_ca_blob 参数校验——合法 PEM bytes 接受、null 清空、
+        /// 无效 mgr 返回 -1。真 TLS 握手效果不在本测试范围（见文件头缺口注记）。
+        /// </summary>
+        [Test]
+        public void SetCaBlob_ArgValidation()
+        {
+            byte[] pem = System.Text.Encoding.UTF8.GetBytes(
+                "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n");
+            Assert.That(DlmgrDLL.dlmgr_set_ca_blob(_mgr, pem), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_set_ca_blob(_mgr, null), Is.EqualTo(0)); // 清空
+            Assert.That(DlmgrDLL.dlmgr_set_ca_blob(IntPtr.Zero, pem), Is.EqualTo(-1));
         }
 
         /// <summary>

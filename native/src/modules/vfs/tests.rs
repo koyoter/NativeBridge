@@ -825,3 +825,50 @@ fn ffi_open_paths() {
     assert!(unsafe { vfs_open_paths(same.as_ptr(), same.as_ptr()) }.is_null());
     assert!(unsafe { vfs_open_paths(ptr::null(), d.as_ptr()) }.is_null());
 }
+
+#[test]
+fn flush_reuses_bigger_free_slot_instead_of_growing_header() {
+    let td = TempDir::new();
+    let v = Vfs::open(&td.0).unwrap();
+    seq_write(&v, "a", &[1; 200]).unwrap();
+    v.flush().unwrap(); // 小 region
+    seq_write(&v, "b", &[2; 8000]).unwrap();
+    v.flush().unwrap(); // 大 region（cap 大）
+    v.delete("b").unwrap();
+    v.flush().unwrap(); // 内容缩回：应复用大容量空闲槽而非尾部追加
+    let hp = td.0.join("header.vfs");
+    let stable = fs::metadata(&hp).unwrap().len();
+    for _ in 0..6 {
+        v.flush().unwrap();
+        assert_eq!(
+            fs::metadata(&hp).unwrap().len(),
+            stable,
+            "header.vfs 不应继续增长"
+        );
+    }
+    let v = Vfs::open(&td.0).unwrap();
+    assert!(v.lookup("a").is_ok());
+    assert!(v.lookup("b").is_err()); // Deleted 不复活
+}
+
+#[test]
+fn legacy_region_without_slot_cap_still_scans() {
+    let td = TempDir::new();
+    let v = Vfs::open(&td.0).unwrap();
+    seq_write(&v, "a", &[1; 64]).unwrap();
+    v.flush().unwrap();
+    drop(v);
+    // 把现役 region 退化为旧格式（slot_cap=0）：旧文件必须继续可扫可开。
+    let hp = td.0.join("header.vfs");
+    let mut bytes = fs::read(&hp).unwrap();
+    let mut region = format::build_region(2, 4096, &mut Vec::new(), &[]);
+    region.bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+    bytes.truncate(format::SB_SIZE as usize);
+    bytes.extend_from_slice(&region.bytes);
+    bytes[..64].copy_from_slice(&format::sb_image(2));
+    fs::write(&hp, &bytes).unwrap();
+    let v = Vfs::open(&td.0).unwrap();
+    assert!(v.lookup("a").is_err()); // 空 index：旧条目已不在（本测试只验格式兼容）
+    v.flush().unwrap();
+    assert!(Vfs::open(&td.0).unwrap().lookup("a").is_err());
+}

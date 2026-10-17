@@ -145,12 +145,18 @@ pub(crate) struct CompactCtl {
 #[derive(Clone, Copy)]
 struct Slot {
     off: u64,
+    /// 内容长度（走槽长度）：新格式槽 == 槽容量；旧格式槽 == framing 自算长度。
     len: u64,
+    /// 槽容量（0 = 旧格式槽，只能等长复用）。覆写内容时容量不变。
+    cap: u64,
 }
 
 struct RegionLayout {
     active: Slot,
-    inactive: Option<Slot>,
+    /// 空闲槽池（active 之外的全部完整槽位）：新格式槽（cap>0）任意 ≥ 需求
+    /// 容量即可复用，旧格式槽仅"等长 + framing 相同"原位复用——header.vfs
+    /// 不再随 flush 次数单调增长。
+    free: Vec<Slot>,
     /// End of complete slots, including CRC-invalid ones; excludes partial appends.
     append_end: u64,
 }
@@ -197,45 +203,77 @@ impl VfsShared {
         if hlen > layout.append_end {
             hf.set_len(layout.append_end).map_err(ioerr)?;
         }
-        // An interrupted in-place write must not change the framing used to find
-        // later slots. Equal total length alone does not imply equal table/blob lengths.
-        let reusable = if let Some(s) = layout.inactive {
-            if bytes.len() as u64 == s.len {
-                let mut framing = [0u8; 8];
-                pread(&hf, s.off + 8, &mut framing).map_err(ioerr)?;
-                framing == bytes[8..16]
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let dest = if reusable {
-            layout.inactive.unwrap()
-        } else {
-            Slot {
-                off: layout.append_end,
-                len: bytes.len() as u64,
-            }
-        };
-        let end = dest
-            .off
-            .checked_add(dest.len)
-            .ok_or(VfsError::WriteOverflow)?;
-        if reusable {
-            // Leave the slot boundary fields untouched even during a torn write.
-            pwrite(&hf, dest.off, &bytes[..8]).map_err(ioerr)?;
-            pwrite(&hf, dest.off + 16, &bytes[16..]).map_err(ioerr)?;
-        } else {
-            pwrite(&hf, dest.off, bytes).map_err(ioerr)?;
+        // 目标槽选择：1) 新格式空闲槽中容量 ≥ 需求的最小者 → 容量复用（内容短于
+        // 容量，槽尾陈旧字节无碍——解析只看 framing）；2) 旧格式槽等长且 framing
+        // 相同 → 原位复用（A/B 翻转常态）；3) 尾部追加新槽（容量 = 内容长度）。
+        enum Mode {
+            Capacity,
+            Twin,
+            Fresh,
         }
-        layout.append_end = layout.append_end.max(end);
+        let len = bytes.len() as u64;
+        let cap_pick = layout
+            .free
+            .iter()
+            .filter(|s| s.cap >= len)
+            .min_by_key(|s| s.cap)
+            .copied();
+        let (dest, mode) = match cap_pick {
+            Some(s) => (s, Mode::Capacity),
+            None => {
+                let legacy = layout
+                    .free
+                    .iter()
+                    .filter(|s| s.cap == 0 && s.len == len)
+                    .copied()
+                    .find(|s| {
+                        let mut framing = [0u8; 8];
+                        pread(&hf, s.off + 8, &mut framing).is_ok() && framing == bytes[8..16]
+                    });
+                match legacy {
+                    Some(s) => (s, Mode::Twin),
+                    None => (
+                        Slot {
+                            off: layout.append_end,
+                            len,
+                            cap: len,
+                        },
+                        Mode::Fresh,
+                    ),
+                }
+            }
+        };
+        // slot_cap 字段按目标槽写：容量复用保持槽容量，旧格式原位复用保持 0。
+        let mut img = bytes.to_vec();
+        let cap_field: u32 = match mode {
+            Mode::Twin => 0,
+            _ => dest.cap as u32,
+        };
+        img[28..32].copy_from_slice(&cap_field.to_le_bytes());
+        match mode {
+            // 容量复用：framing 会变，撕裂写中间态最坏 crc 失配（槽被判垃圾，
+            // 仍按 cap 走槽），不会错位后续槽位。
+            Mode::Capacity => {
+                pwrite(&hf, dest.off, &img[..8]).map_err(ioerr)?;
+                pwrite(&hf, dest.off + 8, &img[8..]).map_err(ioerr)?;
+            }
+            // 等长复用：撕裂写期间边界字段 [8..16) 保持不动，后续槽位定位不变。
+            Mode::Twin => {
+                pwrite(&hf, dest.off, &img[..8]).map_err(ioerr)?;
+                pwrite(&hf, dest.off + 16, &img[16..]).map_err(ioerr)?;
+            }
+            Mode::Fresh => {
+                pwrite(&hf, dest.off, &img).map_err(ioerr)?;
+            }
+        }
+        layout.append_end = layout.append_end.max(dest.off + dest.len);
         hf.sync_all().map_err(ioerr)?;
         pwrite(&hf, SB_GEN_OFF, &format::sb_patch(gen)).map_err(ioerr)?;
         hf.sync_all().map_err(ioerr)?;
         let old = layout.active;
         layout.active = dest;
-        layout.inactive = Some(old);
+        layout.free.retain(|s| s.off != dest.off);
+        layout.free.push(old);
         // 翻转成功才推进水位线；失败保持原值，同 gen 可重试。
         *self.persisted_gen.lock().unwrap() = gen;
         Ok(())
@@ -376,15 +414,17 @@ impl Vfs {
                 let active = Slot {
                     off: s.off,
                     len: s.total,
+                    cap: s.cap,
                 };
-                let inactive = slots
+                let free = slots
                     .iter()
                     .filter(|o| o.off != s.off)
-                    .max_by_key(|o| o.total)
                     .map(|o| Slot {
                         off: o.off,
                         len: o.total,
-                    });
+                        cap: o.cap,
+                    })
+                    .collect();
                 (
                     p.gen,
                     p.logical,
@@ -392,7 +432,7 @@ impl Vfs {
                     p.names.clone(),
                     RegionLayout {
                         active,
-                        inactive,
+                        free,
                         append_end: pos as u64,
                     },
                 )
@@ -418,8 +458,9 @@ impl Vfs {
                         active: Slot {
                             off: SB_SIZE,
                             len: img.bytes.len() as u64,
+                            cap: img.bytes.len() as u64,
                         },
-                        inactive: None,
+                        free: Vec::new(),
                         append_end: buf.len() as u64,
                     },
                 )

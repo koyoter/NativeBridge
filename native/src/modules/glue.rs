@@ -9,10 +9,12 @@
 //! * `abort()`       → `writer.abort`（条目丢弃，区间成垃圾）
 //!
 //! 生命周期：句柄经 `dlmgr_sink_release`（任务终态后由宿主调用）经注册表 dtor 回收；
-//! `vfs` 句柄存活期必须覆盖每个由它创建的 sink（vfs 模块文档中的宿主约定）。
+//! ctx 持有 `Arc<Vfs>` 克隆，宿主提前 `vfs_close`/Dispose 不再产生悬垂
+//!（Vfs 存活至最后一个 sink 释放；推荐宿主仍按"vfs 句柄覆盖 sink 存活期"使用）。
 
 use std::ffi::CStr;
 use std::slice;
+use std::sync::Arc;
 
 use libc::{c_char, c_void};
 
@@ -20,15 +22,15 @@ use crate::modules::dlmgr::sink::{register_full, SinkVTable};
 use crate::modules::vfs::{Vfs, VfsError, VfsWriter};
 
 struct VfsSinkCtx {
-    /// vfs_open 的 Arc 句柄（`Arc::into_raw` 产物），仅借用不拥有。
-    vfs: *const Vfs,
+    /// vfs_open 句柄的 owned 克隆：宿主 vfs_close/Dispose 早于 sink 释放也不再悬垂。
+    vfs: Arc<Vfs>,
     name: String,
     writer: Option<VfsWriter>,
 }
 
 unsafe extern "C" fn vs_prepare(ctx: *mut c_void, size: u64) -> i32 {
     let c = &mut *(ctx as *mut VfsSinkCtx);
-    match (*c.vfs).alloc(&c.name, size) {
+    match c.vfs.alloc(&c.name, size) {
         Ok(w) => {
             c.writer = Some(w);
             0
@@ -96,8 +98,14 @@ pub unsafe extern "C" fn dlvfs_sink_create_for_vfs(
         return 0;
     }
     let ctx = Box::into_raw(Box::new(VfsSinkCtx {
-        // vfs_open = Arc::into_raw(Arc<Vfs>)，返回值即指向 Vfs 的裸指针，直接借用。
-        vfs: vfs as *const Vfs,
+        // vfs_open = Arc::into_raw(Arc<Vfs>)：重建宿主引用克隆一份后原样奉还
+        //（clone + forget），ctx 从此拥有自己的引用计数。
+        vfs: {
+            let host = Arc::from_raw(vfs as *const Vfs);
+            let owned = host.clone();
+            std::mem::forget(host);
+            owned
+        },
         name: name.to_string(),
         writer: None,
     }));

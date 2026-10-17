@@ -14,7 +14,7 @@ pub(crate) const TASK_DONE: i32 = 3;
 pub(crate) const TASK_FAILED: i32 = 4;
 pub(crate) const TASK_CANCELED: i32 = 5;
 
-// --- 任务错误码（OK=0 UNSUPPORTED_RANGE=1 SIZE_MISMATCH=2 CRC_MISMATCH=3 NETWORK=4 TIMEOUT=5 CANCELED=6）---
+// --- 任务错误码（OK=0 UNSUPPORTED_RANGE=1 SIZE_MISMATCH=2 CRC_MISMATCH=3 NETWORK=4 TIMEOUT=5 CANCELED=6 BUSY=7）---
 pub(crate) const ERR_OK: i32 = 0;
 pub(crate) const ERR_UNSUPPORTED_RANGE: i32 = 1;
 pub(crate) const ERR_SIZE_MISMATCH: i32 = 2;
@@ -22,6 +22,7 @@ pub(crate) const ERR_CRC_MISMATCH: i32 = 3;
 pub(crate) const ERR_NETWORK: i32 = 4;
 pub(crate) const ERR_TIMEOUT: i32 = 5;
 pub(crate) const ERR_CANCELED: i32 = 6;
+pub(crate) const ERR_BUSY: i32 = 7;
 
 /// 任务共享态：入队后 worker / reporter / FFI 三方仅做原子读写，无逐字段锁。
 pub(crate) struct TaskShared {
