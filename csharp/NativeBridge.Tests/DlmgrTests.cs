@@ -1058,7 +1058,10 @@ namespace NativeBridgeF.Tests
                 ulong low2 = EnqueueLocal(mgr, fastUrl, "prio-low2", fastData, sinks[2]);
                 ulong urgent = EnqueueLocal(mgr, fastUrl, "prio-urgent", fastData, sinks[3]);
 
-                // 反证：运行中任务不可抢占（提权返回 -1）；未知 id 返回 -1
+                // 反证：运行中任务不可抢占（提权返回 -1）；未知 id 返回 -1。
+                // 先等 slow 真正 Running——慢 runner 上入队到出队有窗口，Pending
+                // 状态提权合法返回 0（曾致本测试在 mac runner 上 flaky）。
+                WaitState(slowId, (int)DlmgrTaskState.Running, 10_000);
                 Assert.That(DlmgrDLL.dlmgr_set_priority(mgr, slowId, 5), Is.EqualTo(-1),
                             "运行中任务提权应被拒绝");
                 Assert.That(DlmgrDLL.dlmgr_set_priority(mgr, 9999, 5), Is.EqualTo(-1));
