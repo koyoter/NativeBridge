@@ -18,3 +18,12 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# 非 测试代码禁 panic 的强制层（规则见仓库根 CLAUDE.md；测试代码经 clippy.toml 豁免）。
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"

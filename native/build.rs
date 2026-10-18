@@ -1,3 +1,7 @@
+// 构建脚本契约：必需 env 缺失时 panic 就是构建错误报告机制，不适用"禁 panic"规则
+// （[lints.clippy] 覆盖 build script，故整文件豁免）。
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::env;
 use std::path::Path;
 

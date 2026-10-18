@@ -41,6 +41,8 @@ fn data_of(dir: &Path) -> Vec<u8> {
     fs::read(dir.join("files.vfs")).unwrap()
 }
 
+// 测试允许 panic：轮询超时以此失败（全套测试唯一一处 panic!）。
+#[allow(clippy::panic)]
 fn wait_idle(v: &Vfs) {
     for _ in 0..60_000 {
         if v.compact_status().0 == COMPACT_IDLE {
@@ -878,4 +880,30 @@ fn legacy_region_without_slot_cap_still_scans() {
     assert!(v.lookup("a").is_err()); // 空 index：旧条目已不在（本测试只验格式兼容）
     v.flush().unwrap();
     assert!(Vfs::open(&td.0).unwrap().lookup("a").is_err());
+}
+
+/// 回归（panic 规则）：stat 遇溢出对齐的 size 须饱和而非 panic。
+/// 修复前 `format::align4k(u64::MAX)` → checked_align4k 为 None → expect panic。
+/// 正常写入路径有 WriteOverflow 拦截，超界条目只能内部注入。
+#[test]
+fn stat_saturates_on_huge_entry_size() {
+    let td = TempDir::new();
+    let v = Vfs::open(&td.0).unwrap();
+    v.shared
+        .inner
+        .lock()
+        .unwrap()
+        .idx
+        .entries
+        .push(format::Entry {
+            name_off: 0,
+            name_len: 0,
+            state: format::ST_ACTIVE,
+            offset: 0,
+            size: u64::MAX,
+            crc: 0,
+        });
+    let s = v.stat();
+    assert_eq!(s.active, u64::MAX);
+    assert_eq!(s.garbage, 0);
 }

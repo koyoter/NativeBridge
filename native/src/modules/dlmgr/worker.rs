@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use libc::{c_char, c_void, size_t};
@@ -248,11 +249,11 @@ fn backoff_wait(task: &TaskShared, retry_no: u32) -> bool {
 
 pub(crate) fn spawn(sh: &Arc<Shared>) {
     let share = SendPtr(sh.share.0);
-    let doh = sh.doh.lock().unwrap().clone();
-    let ca = sh.ca_blob.lock().unwrap().clone();
+    let doh = sh.doh.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let ca = sh.ca_blob.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let http_version = sh.http_version.load(Ordering::Relaxed);
     let count = sh.worker_count;
-    let mut handles = sh.workers.lock().unwrap();
+    let mut handles = sh.workers.lock().unwrap_or_else(PoisonError::into_inner);
     for _ in 0..count {
         let s = sh.clone();
         let doh = doh.clone();
@@ -270,7 +271,7 @@ pub(crate) fn spawn(sh: &Arc<Shared>) {
 /// 出队即在锁内置 RUNNING：active_count 出队即计数，消除"已出队仍 Pending"空窗
 /// （C# 以 active_count==0 作为整理前置，空窗内启动整理会让任务在 prepare 时冤死）。
 fn take_task(sh: &Shared) -> Option<Arc<TaskShared>> {
-    let mut q = sh.queue.lock().unwrap();
+    let mut q = sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
         if q.shutdown {
             return None;
@@ -281,7 +282,7 @@ fn take_task(sh: &Shared) -> Option<Arc<TaskShared>> {
                 return Some(ht.task);
             }
         }
-        q = sh.cv.wait(q).unwrap();
+        q = sh.cv.wait(q).unwrap_or_else(PoisonError::into_inner);
     }
 }
 

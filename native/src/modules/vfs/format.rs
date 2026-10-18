@@ -32,7 +32,8 @@ pub(crate) const ST_DELETED: u8 = 1;
 pub(crate) const ST_DOWNLOADING: u8 = 2;
 pub(crate) const ST_BAD: u8 = 3;
 
-/// 4K 对齐（0 → 0）。
+/// 4K 对齐（0 → 0）。仅测试用：非测试路径一律 checked_align4k + 错误传播。
+#[cfg(test)]
 pub(crate) fn align4k(n: u64) -> u64 {
     checked_align4k(n).expect("vfs: invalid aligned size")
 }

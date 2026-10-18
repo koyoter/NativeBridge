@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use libc::c_void;
 
@@ -54,7 +54,7 @@ fn next_handle() -> &'static AtomicU64 {
 
 pub(crate) fn register_full(vt: SinkVTable, dtor: Option<unsafe extern "C" fn(*mut c_void)>) -> u64 {
     let h = next_handle().fetch_add(1, Ordering::Relaxed) + 1; // 0 保留为失败值
-    registry().lock().unwrap().insert(h, SinkEntry { vt, dtor });
+    registry().lock().unwrap_or_else(PoisonError::into_inner).insert(h, SinkEntry { vt, dtor });
     h
 }
 
@@ -63,7 +63,7 @@ pub(crate) fn sink_release(h: u64) {
     if h == 0 {
         return;
     }
-    if let Some(e) = registry().lock().unwrap().remove(&h) {
+    if let Some(e) = registry().lock().unwrap_or_else(PoisonError::into_inner).remove(&h) {
         if let Some(d) = e.dtor {
             unsafe { d(e.vt.ctx) };
         }
@@ -72,7 +72,7 @@ pub(crate) fn sink_release(h: u64) {
 
 /// 取一份 vtable 拷贝（worker 执行期间注册表项保证存活：宿主约定终态后才 release）。
 pub(crate) fn sink_lookup(h: u64) -> Option<SinkVTable> {
-    registry().lock().unwrap().get(&h).map(|e| e.vt)
+    registry().lock().unwrap_or_else(PoisonError::into_inner).get(&h).map(|e| e.vt)
 }
 
 // --- FileSink：pwrite 落普通文件（每 sink 一个独立 OS 句柄）---

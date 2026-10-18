@@ -1,6 +1,6 @@
 //! 双令牌桶限速（Q8/Q10）：全局 + 单任务桶，实际速率取 min；0 = 不限，动态生效。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 struct BucketState {
@@ -27,7 +27,7 @@ impl TokenBucket {
 
     /// 动态改速率（0 = 不限）；存量 token 按新容量截断。
     pub(crate) fn set_rate(&self, rate_bps: u64) {
-        let mut st = self.st.lock().unwrap();
+        let mut st = self.st.lock().unwrap_or_else(PoisonError::into_inner);
         Self::refill(&mut st);
         st.rate_bps = rate_bps;
         if rate_bps > 0 {
@@ -49,7 +49,7 @@ impl TokenBucket {
         if want == 0 {
             return 0;
         }
-        let mut st = self.st.lock().unwrap();
+        let mut st = self.st.lock().unwrap_or_else(PoisonError::into_inner);
         Self::refill(&mut st);
         if st.rate_bps == 0 {
             return want;
@@ -68,7 +68,7 @@ impl TokenBucket {
         if n == 0 {
             return;
         }
-        let mut st = self.st.lock().unwrap();
+        let mut st = self.st.lock().unwrap_or_else(PoisonError::into_inner);
         Self::refill(&mut st);
         if st.rate_bps > 0 {
             st.tokens = (st.tokens + n as f64).min(st.rate_bps as f64);

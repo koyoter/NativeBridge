@@ -10,6 +10,8 @@ use std::ffi::CString;
 use std::sync::OnceLock;
 
 #[no_mangle]
+// 例外位点（可证不失败）：版本串由 format! 与 C 字符串组件拼接，不可能含内部 NUL。
+#[allow(clippy::expect_used)]
 pub unsafe extern "C" fn nativebridge_version() -> *const c_char {
     static VERSION: OnceLock<CString> = OnceLock::new();
     VERSION
@@ -22,7 +24,7 @@ pub unsafe extern "C" fn nativebridge_version() -> *const c_char {
                 ssl_v,
                 h2_v
             );
-            CString::new(s).unwrap()
+            CString::new(s).expect("version string cannot contain NUL")
         })
         .as_ptr()
 }

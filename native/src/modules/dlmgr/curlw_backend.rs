@@ -212,6 +212,8 @@ impl HeaderList {
         let mut head: *mut c_void = ptr::null_mut();
         let mut keep: Vec<CString> = Vec::new();
         if let Some(off) = range {
+            // 例外位点（可证不失败）：Range 头由 format! 生成，无内部 NUL。
+            #[allow(clippy::expect_used)]
             let c = CString::new(format!("Range: bytes={off}-")).expect("no interior NUL");
             unsafe {
                 head = curlw_slist_append(ptr::null_mut(), c.as_ptr()) as *mut c_void;

@@ -21,7 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use libc::{c_char, c_int, c_void};
 
@@ -189,12 +189,12 @@ impl VfsShared {
     /// 返回 GenChanged，防止把 SuperBlock 翻回旧 region；等于水位线放行——同 gen 的
     /// 重复 flush 合法（写闲置槽 + 翻转无害），只有"倒退"才拦截。
     fn persist_image(&self, gen: u64, bytes: &[u8]) -> Result<(), VfsError> {
-        let _pl = self.persist_lock.lock().unwrap();
-        if gen < *self.persisted_gen.lock().unwrap() {
+        let _pl = self.persist_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if gen < *self.persisted_gen.lock().unwrap_or_else(PoisonError::into_inner) {
             return Err(VfsError::GenChanged);
         }
-        let hf = self.header_file.lock().unwrap();
-        let mut layout = self.layout.lock().unwrap();
+        let hf = self.header_file.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut layout = self.layout.lock().unwrap_or_else(PoisonError::into_inner);
         // Discard only an incomplete append left by a failed write.
         let hlen = hf.metadata().map_err(ioerr)?.len();
         if hlen < layout.append_end {
@@ -275,13 +275,13 @@ impl VfsShared {
         layout.free.retain(|s| s.off != dest.off);
         layout.free.push(old);
         // 翻转成功才推进水位线；失败保持原值，同 gen 可重试。
-        *self.persisted_gen.lock().unwrap() = gen;
+        *self.persisted_gen.lock().unwrap_or_else(PoisonError::into_inner) = gen;
         Ok(())
     }
 
     /// commit 回调在锁外触发（允许回调内重入 VFS 查询）。
     fn fire_commit(&self, name: &str, off: u64, size: u64, crc: u32) {
-        let cb = self.commit_cb.lock().unwrap().clone();
+        let cb = self.commit_cb.lock().unwrap_or_else(PoisonError::into_inner).clone();
         if let Some((f, user)) = cb {
             let c = CString::new(name).unwrap_or_default();
             unsafe { f(user as *mut c_void, c.as_ptr(), off, size, crc) };
@@ -294,7 +294,7 @@ impl VfsShared {
 /// 模块私有：VfsShared 本就是 vfs 私有类型，不得超出本模块可见。
 fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
     let (mut entries, names, gen, logical) = {
-        let g = shared.inner.lock().unwrap();
+        let g = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         (
             g.idx.entries.clone(),
             g.idx.names.clone(),
@@ -302,7 +302,7 @@ fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
             g.idx.logical,
         )
     };
-    shared.data_file.lock().unwrap().sync_all().map_err(ioerr)?;
+    shared.data_file.lock().unwrap_or_else(PoisonError::into_inner).sync_all().map_err(ioerr)?;
     let img = format::build_region(gen, logical, &mut entries, &names);
     shared.persist_image(gen, &img.bytes)
 }
@@ -382,12 +382,13 @@ impl Vfs {
             slots.push(s);
         }
         // 选 active：sb 有效时 gen 匹配者优先，否则取 gen 最高且校验通过者。
-        let mut best: Option<&SlotScan> = None;
+        // 元组携带已解析态，消除对 parsed.unwrap() 不变式的依赖。
+        let mut best: Option<(&SlotScan, &format::ParsedRegion)> = None;
         for s in &slots {
             let Some(p) = &s.parsed else { continue };
-            let better = match best.map(|b| b.parsed.as_ref().unwrap()) {
+            let better = match best {
                 None => true,
-                Some(bp) => {
+                Some((_, bp)) => {
                     if Some(p.gen) == sb_gen && Some(bp.gen) != sb_gen {
                         true
                     } else if Some(bp.gen) == sb_gen {
@@ -398,13 +399,12 @@ impl Vfs {
                 }
             };
             if better {
-                best = Some(s);
+                best = Some((s, p));
             }
         }
 
         let (generation, logical, entries, names, layout) = match best {
-            Some(s) => {
-                let p = s.parsed.as_ref().unwrap();
+            Some((s, p)) => {
                 // Downloading 残留：条目丢弃，区间成垃圾（逻辑大小不动 → stat.garbage 计入）。
                 let entries: Vec<Entry> = p
                     .entries
@@ -506,7 +506,7 @@ impl Vfs {
             return Err(VfsError::InvalidArg);
         }
         let aligned = format::checked_align4k(size).ok_or(VfsError::WriteOverflow)?;
-        let mut g = self.shared.inner.lock().unwrap();
+        let mut g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -536,7 +536,7 @@ impl Vfs {
         g.writers += 1;
         // 物理不足则扩容（inner 锁内完成，保证预约与容量一致）；失败回滚登记。
         let grown = (|| -> io::Result<()> {
-            let df = self.shared.data_file.lock().unwrap();
+            let df = self.shared.data_file.lock().unwrap_or_else(PoisonError::into_inner);
             let phys = df.metadata()?.len();
             if phys < logical {
                 df.set_len(logical)?;
@@ -579,7 +579,7 @@ impl Vfs {
 
     /// 软删除：Active → Deleted（generation++）；已 Deleted 幂等；Downloading/Bad 拒绝。
     pub(crate) fn delete(&self, name: &str) -> Result<(), VfsError> {
-        let mut g = self.shared.inner.lock().unwrap();
+        let mut g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -600,7 +600,7 @@ impl Vfs {
     /// Finalize 竞速）被水位线拒绝，以 GenChanged 浮出。
     pub(crate) fn flush(&self) -> Result<(), VfsError> {
         {
-            let g = self.shared.inner.lock().unwrap();
+            let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             if g.compacting {
                 return Err(VfsError::BusyCompacting);
             }
@@ -610,7 +610,7 @@ impl Vfs {
 
     /// 内存索引应答（热路径零文件 I/O）。整理期间 BUSY。
     pub(crate) fn lookup(&self, name: &str) -> Result<VfsEntryInfo, VfsError> {
-        let g = self.shared.inner.lock().unwrap();
+        let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -626,7 +626,7 @@ impl Vfs {
     /// enumerate 两段式第 1 步：返回 (generation, 条目数, 名字 blob 字节数)。
     /// blob 字节数为紧凑口径（与 enumerate_read 的实际写入一致）。
     pub(crate) fn enumerate_query(&self) -> Result<(u64, u32, u32), VfsError> {
-        let g = self.shared.inner.lock().unwrap();
+        let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -639,7 +639,7 @@ impl Vfs {
 
     /// FFI 用的尺寸预查（gen 变化即 GEN_CHANGED，避免按过期 blob_len 建切片）。
     fn enumerate_meta(&self, gen: u64) -> Result<(usize, usize), VfsError> {
-        let g = self.shared.inner.lock().unwrap();
+        let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -660,7 +660,7 @@ impl Vfs {
         crc: &mut [u32],
         state: &mut [u8],
     ) -> Result<(), VfsError> {
-        let g = self.shared.inner.lock().unwrap();
+        let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.compacting {
             return Err(VfsError::BusyCompacting);
         }
@@ -693,21 +693,22 @@ impl Vfs {
     }
 
     pub(crate) fn get_generation(&self) -> u64 {
-        self.shared.inner.lock().unwrap().idx.generation
+        self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner).idx.generation
     }
 
     /// 整理期间不受限（§2.3）。
     pub(crate) fn stat(&self) -> VfsStat {
-        let g = self.shared.inner.lock().unwrap();
+        let g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut total = 0u64;
         let mut active = 0u64;
         let mut deleted = 0u64;
         for e in &g.idx.entries {
-            let a = format::align4k(e.size);
-            total += a;
+            // 受损 header 可能带溢出对齐的 size：stat 是只读概览，饱和即可。
+            let a = format::checked_align4k(e.size).unwrap_or(u64::MAX);
+            total = total.saturating_add(a);
             match e.state {
-                ST_ACTIVE => active += a,
-                ST_DELETED => deleted += a,
+                ST_ACTIVE => active = active.saturating_add(a),
+                ST_DELETED => deleted = deleted.saturating_add(a),
                 _ => {}
             }
         }
@@ -716,7 +717,7 @@ impl Vfs {
             .shared
             .data_file
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .metadata()
             .map(|m| m.len())
             .unwrap_or(0);
@@ -739,7 +740,7 @@ impl Vfs {
         user: usize,
     ) -> Result<(), VfsError> {
         {
-            let mut g = self.shared.inner.lock().unwrap();
+            let mut g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             if g.compacting {
                 return Err(VfsError::BusyCompacting);
             }
@@ -768,7 +769,7 @@ impl Vfs {
         )
         .is_err()
         {
-            let mut g = self.shared.inner.lock().unwrap();
+            let mut g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             g.compacting = false;
             self.shared.ctl.state.store(COMPACT_IDLE, Ordering::Relaxed);
             return Err(VfsError::Io);
@@ -861,7 +862,7 @@ impl VfsWriter {
             !self.crc_raw
         };
         {
-            let mut g = self.shared.inner.lock().unwrap();
+            let mut g = self.shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             if g.compacting {
                 return Err(VfsError::BusyCompacting);
             }
@@ -1165,7 +1166,7 @@ pub unsafe extern "C" fn vfs_set_commit_callback(
     let Some(v) = (h as *const Vfs).as_ref() else {
         return VfsError::InvalidArg.as_i32() as c_int;
     };
-    let mut g = v.shared.commit_cb.lock().unwrap();
+    let mut g = v.shared.commit_cb.lock().unwrap_or_else(PoisonError::into_inner);
     *g = cb.map(|f| (f, user as usize));
     VFS_OK as c_int
 }

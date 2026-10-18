@@ -19,7 +19,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use libc::{c_char, c_void};
@@ -144,7 +144,7 @@ impl Shared {
 
     /// 从队列摘除 id（若在排队）；返回是否摘到。锁序：queue 单锁，无嵌套。
     fn remove_queued(&self, id: u64) -> bool {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if q.heap.is_empty() {
             return false;
         }
@@ -171,7 +171,7 @@ impl Shared {
     /// O(n) 足够。仅排队中的任务可改——运行中不可抢占、终态已退役，均返回 false。
     /// 同级排序沿用原 seq（FIFO 不变）。锁序：queue 单锁，无嵌套。
     fn set_priority(&self, id: u64, priority: i32) -> bool {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if q.heap.is_empty() {
             return false;
         }
@@ -208,8 +208,8 @@ impl Shared {
 
     /// cancel_all：清空队列（逐个标 Canceled）+ 给运行中任务打取消旗标。
     fn cancel_all(&self) {
-        let drained: Vec<HeapTask> = self.queue.lock().unwrap().heap.drain().collect();
-        let tasks = self.tasks.lock().unwrap();
+        let drained: Vec<HeapTask> = self.queue.lock().unwrap_or_else(PoisonError::into_inner).heap.drain().collect();
+        let tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
         for ht in drained {
             self.mark_canceled(&ht.task);
         }
@@ -272,7 +272,7 @@ pub unsafe extern "C" fn dlmgr_add_doh_url(mgr: *mut c_void, url: *const c_char)
     if url.is_empty() {
         return -1;
     }
-    *sh.doh.lock().unwrap() = Some(url);
+    *sh.doh.lock().unwrap_or_else(PoisonError::into_inner) = Some(url);
     0
 }
 
@@ -284,10 +284,10 @@ pub unsafe extern "C" fn dlmgr_add_doh_url(mgr: *mut c_void, url: *const c_char)
 pub unsafe extern "C" fn dlmgr_set_ca_blob(mgr: *mut c_void, data: *const u8, len: usize) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
     if data.is_null() || len == 0 {
-        *sh.ca_blob.lock().unwrap() = None;
+        *sh.ca_blob.lock().unwrap_or_else(PoisonError::into_inner) = None;
         return 0;
     }
-    *sh.ca_blob.lock().unwrap() = Some(std::slice::from_raw_parts(data, len).to_vec());
+    *sh.ca_blob.lock().unwrap_or_else(PoisonError::into_inner) = Some(std::slice::from_raw_parts(data, len).to_vec());
     0
 }
 
@@ -307,14 +307,23 @@ pub unsafe extern "C" fn dlmgr_set_http_version(mgr: *mut c_void, version: i64) 
 }
 
 /// 启动 worker 池 + reporter 线程（幂等）。curlw_global_init 由宿主负责，dlmgr 不调用。
+/// 先起 reporter：它承担全部终态回调，起不来必须报错回滚 started（宿主可重试），
+/// 且必须在 worker 之前——worker::spawn 无幂等护栏，失败重试会重复入池。
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_start(mgr: *mut c_void) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
     if sh.started.swap(true, Ordering::SeqCst) {
         return 0;
     }
+    let reporter = match report::spawn(sh.clone()) {
+        Ok(h) => h,
+        Err(_) => {
+            sh.started.store(false, Ordering::SeqCst);
+            return -1;
+        }
+    };
+    *sh.reporter.lock().unwrap_or_else(PoisonError::into_inner) = Some(reporter);
     worker::spawn(sh);
-    *sh.reporter.lock().unwrap() = Some(report::spawn(sh.clone()));
     0
 }
 
@@ -348,7 +357,7 @@ pub unsafe extern "C" fn dlmgr_enqueue(
         return -1; // 未注册的 sink 句柄
     }
     {
-        let mut q = sh.queue.lock().unwrap();
+        let mut q = sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if q.shutdown {
             return -1;
         }
@@ -356,7 +365,7 @@ pub unsafe extern "C" fn dlmgr_enqueue(
         let t = Arc::new(TaskShared::new(
             id, range_url, full_url, size, crc32, task_bps, sink,
         ));
-        sh.tasks.lock().unwrap().insert(id, t.clone());
+        sh.tasks.lock().unwrap_or_else(PoisonError::into_inner).insert(id, t.clone());
         q.next_seq += 1;
         let seq = q.next_seq;
         q.heap.push(HeapTask {
@@ -378,7 +387,7 @@ pub unsafe extern "C" fn dlmgr_enqueue(
 pub unsafe extern "C" fn dlmgr_cancel(mgr: *mut c_void, id: u64) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
     let removed = sh.remove_queued(id);
-    let t = sh.tasks.lock().unwrap().get(&id).cloned();
+    let t = sh.tasks.lock().unwrap_or_else(PoisonError::into_inner).get(&id).cloned();
     let Some(t) = t else { return -1 };
     if removed {
         sh.mark_canceled(&t);
@@ -414,7 +423,7 @@ pub unsafe extern "C" fn dlmgr_set_priority(mgr: *mut c_void, task_id: u64, prio
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_pause(mgr: *mut c_void) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    sh.queue.lock().unwrap().paused = true;
+    sh.queue.lock().unwrap_or_else(PoisonError::into_inner).paused = true;
     0
 }
 
@@ -422,7 +431,7 @@ pub unsafe extern "C" fn dlmgr_pause(mgr: *mut c_void) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_resume(mgr: *mut c_void) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    sh.queue.lock().unwrap().paused = false;
+    sh.queue.lock().unwrap_or_else(PoisonError::into_inner).paused = false;
     sh.cv.notify_all();
     0
 }
@@ -443,7 +452,7 @@ pub unsafe extern "C" fn dlmgr_set_task_callback(
     user: *mut c_void,
 ) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    *sh.task_cb.lock().unwrap() = cb.map(|f| (f, SendPtr(user)));
+    *sh.task_cb.lock().unwrap_or_else(PoisonError::into_inner) = cb.map(|f| (f, SendPtr(user)));
     0
 }
 
@@ -455,7 +464,7 @@ pub unsafe extern "C" fn dlmgr_set_global_callback(
     user: *mut c_void,
 ) -> i32 {
     let Some(sh) = shared(mgr) else { return -1 };
-    *sh.global_cb.lock().unwrap() = cb.map(|f| (f, SendPtr(user)));
+    *sh.global_cb.lock().unwrap_or_else(PoisonError::into_inner) = cb.map(|f| (f, SendPtr(user)));
     0
 }
 
@@ -463,7 +472,7 @@ pub unsafe extern "C" fn dlmgr_set_global_callback(
 #[no_mangle]
 pub unsafe extern "C" fn dlmgr_active_count(mgr: *mut c_void) -> u32 {
     let Some(sh) = shared(mgr) else { return 0 };
-    let tasks = sh.tasks.lock().unwrap();
+    let tasks = sh.tasks.lock().unwrap_or_else(PoisonError::into_inner);
     let mut n = 0u32;
     for t in tasks.values() {
         let s = t.state.load(Ordering::Relaxed);
@@ -521,21 +530,21 @@ pub unsafe extern "C" fn dlmgr_shutdown_try(mgr: *mut c_void) -> i32 {
     }
     let Some(sh) = shared(mgr) else { return 0 };
     {
-        let mut q = sh.queue.lock().unwrap();
+        let mut q = sh.queue.lock().unwrap_or_else(PoisonError::into_inner);
         q.shutdown = true;
         q.paused = false;
     }
     sh.cancel_all();
     sh.cv.notify_all();
 
-    let workers = std::mem::take(&mut *sh.workers.lock().unwrap());
+    let workers = std::mem::take(&mut *sh.workers.lock().unwrap_or_else(PoisonError::into_inner));
     for w in workers {
         let _ = w.join();
     }
     // Release 配对 reporter 的 Acquire：stop 可见时全部 worker 的终态写入必已可见，
     // reporter 的最终补拍才能把最后一批终态发出去。
     sh.reporter_stop.store(true, Ordering::Release);
-    let reporter = sh.reporter.lock().unwrap().take();
+    let reporter = sh.reporter.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some(r) = reporter {
         let _ = r.join();
     }

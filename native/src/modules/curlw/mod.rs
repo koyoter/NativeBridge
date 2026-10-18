@@ -10,7 +10,7 @@ use std::ffi::CStr;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 mod bindings;
@@ -178,14 +178,14 @@ pub unsafe extern "C" fn curlw_errno() -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn curlw_global_init(flags: c_int, max_fd_set: c_uint) -> CURLcode {
-    let _lk = global_mtx().lock().unwrap();
+    let _lk = global_mtx().lock().unwrap_or_else(PoisonError::into_inner);
 
     let ec = curl_global_init(flags as c_long);
     if ec != CURLE_OK {
         return ec;
     }
 
-    let mut count = init_count().lock().unwrap();
+    let mut count = init_count().lock().unwrap_or_else(PoisonError::into_inner);
     if *count == 0 {
         // Fallible allocation so a pool OOM surfaces as CURLE_OUT_OF_MEMORY like
         // the C impl (Box::new would abort under panic=abort). Freed with
@@ -206,9 +206,9 @@ pub unsafe extern "C" fn curlw_global_init(flags: c_int, max_fd_set: c_uint) -> 
 
 #[no_mangle]
 pub unsafe extern "C" fn curlw_global_cleanup() {
-    let _lk = global_mtx().lock().unwrap();
+    let _lk = global_mtx().lock().unwrap_or_else(PoisonError::into_inner);
 
-    let mut count = init_count().lock().unwrap();
+    let mut count = init_count().lock().unwrap_or_else(PoisonError::into_inner);
     if *count == 0 {
         return;
     }
@@ -954,7 +954,7 @@ pub unsafe extern "C" fn curlw_share_cleanup(share: *mut CURLSH) -> CURLSHcode {
     // out of sync with libcurl's view of the share (matches the C impl). A null
     // share is handled by curl_share_cleanup, which returns CURLSHE_INVALID.
     let key = share as usize;
-    let mut map = share_locks().lock().unwrap();
+    let mut map = share_locks().lock().unwrap_or_else(PoisonError::into_inner);
     let ec = curl_share_cleanup(share);
     if ec == CURLSHE_OK {
         map.remove(&key);
@@ -984,7 +984,7 @@ pub unsafe extern "C" fn curlw_share_enable_default_locks(share: *mut CURLSH) ->
     // concurrent enable/cleanup can't race the callbacks (matches the C impl).
     // curl_share_setopt only stores the callbacks; it never invokes them, and the
     // callbacks take the per-share locks, not this map lock, so there is no reentry.
-    let mut map = share_locks().lock().unwrap();
+    let mut map = share_locks().lock().unwrap_or_else(PoisonError::into_inner);
     if map.contains_key(&key) {
         return CURLSHE_OK;
     }

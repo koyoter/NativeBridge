@@ -1,0 +1,3 @@
+# 规则 1（禁 panic）只约束非测试代码：测试文件/测试 cfg 允许 unwrap 与 expect。
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

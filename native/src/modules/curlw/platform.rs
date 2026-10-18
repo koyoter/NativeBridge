@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::PoisonError;
 
 pub(super) unsafe fn fd_zero(set: *mut fd_set) {
     #[cfg(windows)]
@@ -140,8 +141,10 @@ impl FdSetPool {
         }
     }
 
+    // 例外位点（可证不失败）：free_list 为空时上面刚压入 chunk_size ≥ 1 个。
+    #[allow(clippy::expect_used)]
     pub(super) fn allocate(&self) -> *mut fd_set {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.free_list.is_empty() {
             let count = inner.chunk_size;
             let mut sets = Vec::with_capacity(count);
@@ -155,14 +158,14 @@ impl FdSetPool {
             }
             inner.blocks.push(sets);
         }
-        inner.free_list.pop().unwrap()
+        inner.free_list.pop().expect("free_list non-empty: filled above or pre-populated")
     }
 
     pub(super) fn deallocate(&self, p: *mut fd_set) {
         if p.is_null() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         inner.free_list.push(p);
     }
 }

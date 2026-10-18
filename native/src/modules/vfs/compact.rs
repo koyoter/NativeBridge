@@ -21,6 +21,7 @@
 use std::fs::{File, OpenOptions};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::PoisonError;
 
 use libc::{c_char, c_int, c_void};
 
@@ -167,7 +168,7 @@ fn run(
         Err(e) => e.as_i32(),
     };
     {
-        let mut g = shared.inner.lock().unwrap();
+        let mut g = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
         g.compacting = false;
     }
     shared.ctl.state.store(COMPACT_IDLE, Ordering::Relaxed);
@@ -188,7 +189,7 @@ fn compact_run(
         // --- Scan ---
         shared.ctl.state.store(COMPACT_SCAN, Ordering::Relaxed);
         let (plan, old_gen) = {
-            let g = shared.inner.lock().unwrap();
+            let g = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             let actives: Vec<(String, Entry)> = g
                 .idx
                 .entries
@@ -238,7 +239,7 @@ fn compact_run(
             }
         }
         if !bad.is_empty() {
-            let mut g = shared.inner.lock().unwrap();
+            let mut g = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             for n in &bad {
                 if let Some(e) = g.idx.find_mut(n) {
                     e.state = ST_BAD;
@@ -295,7 +296,7 @@ fn compact_run(
         // 翻转成功 → 换内存索引（generation 一并递增）。
         let names = img.bytes[img.blob_off..].to_vec();
         {
-            let mut g = shared.inner.lock().unwrap();
+            let mut g = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
             g.idx = super::index::Index::new(new_gen, new_logical, entries, names);
         }
         // 收敛判定：无排挤（无新增可回收的洞）且无 Bad 剔除 → 一轮即终。

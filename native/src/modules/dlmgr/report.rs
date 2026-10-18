@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::PoisonError;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,11 +16,10 @@ use super::Shared;
 
 const REPORT_INTERVAL_MS: u64 = 100; // 10Hz 节流
 
-pub(crate) fn spawn(shared: Arc<Shared>) -> JoinHandle<()> {
+pub(crate) fn spawn(shared: Arc<Shared>) -> Result<JoinHandle<()>, std::io::Error> {
     std::thread::Builder::new()
         .name("dlmgr-reporter".into())
         .spawn(move || reporter_loop(shared))
-        .expect("spawn reporter")
 }
 
 fn reporter_loop(sh: Arc<Shared>) {
@@ -48,9 +48,9 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
     let now = Instant::now();
 
     // 快照进栈，回调全部在锁外触发
-    let snap: Vec<Arc<TaskShared>> = sh.tasks.lock().unwrap().values().cloned().collect();
-    let task_cb = *sh.task_cb.lock().unwrap();
-    let global_cb = *sh.global_cb.lock().unwrap();
+    let snap: Vec<Arc<TaskShared>> = sh.tasks.lock().unwrap_or_else(PoisonError::into_inner).values().cloned().collect();
+    let task_cb = *sh.task_cb.lock().unwrap_or_else(PoisonError::into_inner);
+    let global_cb = *sh.global_cb.lock().unwrap_or_else(PoisonError::into_inner);
 
     let mut active = 0u32;
     let mut bytes_done = 0u64;
@@ -101,7 +101,7 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
 
     // 拍末统一退役：从 tasks 与 prev 移除（回调已先发，快照仍持有克隆 Arc）。
     if !retired.is_empty() {
-        let mut tasks = sh.tasks.lock().unwrap();
+        let mut tasks = sh.tasks.lock().unwrap_or_else(PoisonError::into_inner);
         for id in &retired {
             tasks.remove(id);
             prev.remove(id);
