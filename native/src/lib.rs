@@ -1,7 +1,7 @@
-#![allow(unused_macros)]
-#![allow(nonstandard_style)]
-#![allow(dead_code)]
-#![allow(private_interfaces)]
+// [lib] name = "NativeBridge"（导出库名，不可改）触发 crate 级 non_snake_case，
+// 无文件级豁免点，是唯一保留的 crate 级 allow；其余 lint 已收敛到
+// bindings.rs 的文件级 allow 与逐项删除死码。
+#![allow(non_snake_case)]
 
 mod modules;
 

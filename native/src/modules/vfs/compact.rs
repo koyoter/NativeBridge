@@ -140,7 +140,8 @@ pub(crate) fn build_plan(
 
 /// 由 Vfs::compact 在持有 inner 锁、置位 compacting 之后调用。
 /// 回调以裸函数指针 + usize user 跨线程传递（fn 指针本身 Send+Sync）。
-pub(crate) fn start(
+/// pub(super)：只在 vfs 模块内使用，VfsShared 同样不出 vfs。
+pub(super) fn start(
     shared: Arc<VfsShared>,
     reserve_extra: u64,
     progress: Option<ProgressCb>,

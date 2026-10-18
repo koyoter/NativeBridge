@@ -342,7 +342,8 @@ pub unsafe extern "C" fn dlmgr_enqueue(
         return -1;
     }
     let full_url = cstr_to_string(full_url).unwrap_or_default();
-    let name = cstr_to_string(name).unwrap_or_default();
+    // name 是 ABI 保留位（§3.1）：任务回调签名不带 name，native 不存储。
+    let _ = name;
     if sink == 0 || sink::sink_lookup(sink).is_none() {
         return -1; // 未注册的 sink 句柄
     }
@@ -353,7 +354,7 @@ pub unsafe extern "C" fn dlmgr_enqueue(
         }
         let id = sh.next_task_id.fetch_add(1, Ordering::Relaxed) + 1;
         let t = Arc::new(TaskShared::new(
-            id, name, range_url, full_url, size, crc32, task_bps, sink,
+            id, range_url, full_url, size, crc32, task_bps, sink,
         ));
         sh.tasks.lock().unwrap().insert(id, t.clone());
         q.next_seq += 1;

@@ -1,3 +1,7 @@
+// curl 绑定镜像：C 风格命名与未引用的常量/类型属正常形态，按文件豁免
+// （此前由 crate 级 allow 兜底，现收敛到此）。
+#![allow(dead_code, nonstandard_style)]
+
 use super::*;
 
 pub type CURL = c_void;

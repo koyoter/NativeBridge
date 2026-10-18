@@ -221,7 +221,7 @@ fn canceled_and_sink_error() {
 
 #[test]
 fn backoff_responds_to_cancel() {
-    let t = TaskShared::new(1, "n".into(), "r".into(), String::new(), 1, 0, 0, 0);
+    let t = TaskShared::new(1, "r".into(), String::new(), 1, 0, 0, 0);
     t.cancel.store(true, Ordering::Relaxed);
     assert!(!backoff_wait(&t, 1)); // 取消即时返回，不真等 1s
 }

@@ -28,7 +28,6 @@ fn final_pass_reports_terminal_after_stop() {
     let sh = Arc::new(Shared::new(1, 0, 0, std::ptr::null_mut()));
     let t = Arc::new(TaskShared::new(
         7,
-        "n".into(),
         "r".into(),
         String::new(),
         1,

@@ -412,10 +412,13 @@ fn compact_reserve_overflow_does_not_publish_or_move() {
     v.delete("gap").unwrap();
     let before = fs::read(td.0.join("header.vfs")).unwrap();
     let data = data_of(&td.0);
-    assert!(matches!(v.compact(u64::MAX), Err(VfsError::InvalidArg)));
+    assert!(matches!(
+        v.compact_with(u64::MAX, None, None, 0),
+        Err(VfsError::InvalidArg)
+    ));
     // Fits the old logical size, but not this round's append destination.
     assert!(matches!(
-        v.compact(u64::MAX - v.stat().logical),
+        v.compact_with(u64::MAX - v.stat().logical, None, None, 0),
         Err(VfsError::InvalidArg)
     ));
     assert_eq!(v.compact_status().0, COMPACT_IDLE);
@@ -500,7 +503,7 @@ fn compact_three_layouts() {
     v.delete("f1").unwrap(); // 首部空洞
     v.delete("f3").unwrap(); // 中部空洞
     v.delete("f5").unwrap(); // 尾部大空洞
-    v.compact(8192).unwrap();
+    v.compact_with(8192, None, None, 0).unwrap();
     wait_idle(&v);
     assert_eq!(v.compact_status(), (COMPACT_IDLE, 100));
 
@@ -531,7 +534,7 @@ fn compact_move_beyond_end() {
     seq_write(&v, "f2", &d2).unwrap();
     seq_write(&v, "f3", &d3).unwrap();
     v.delete("f2").unwrap(); // f3 前空 8192 < 12288 → 搬到旧逻辑末尾(24576)之后
-    v.compact(0).unwrap();
+    v.compact_with(0, None, None, 0).unwrap();
     wait_idle(&v);
 
     assert_eq!(v.lookup("f1").unwrap().offset, 0); // 原地
@@ -553,12 +556,12 @@ fn compact_busy_rules() {
     seq_write(&v, "big", &big).unwrap();
 
     let w = v.alloc("w", 100).unwrap();
-    assert!(matches!(v.compact(0), Err(VfsError::BusyWriters)));
+    assert!(matches!(v.compact_with(0, None, None, 0), Err(VfsError::BusyWriters)));
     w.abort();
 
-    v.compact(0).unwrap();
+    v.compact_with(0, None, None, 0).unwrap();
     wait_moving(&v);
-    assert!(matches!(v.compact(0), Err(VfsError::BusyCompacting)));
+    assert!(matches!(v.compact_with(0, None, None, 0), Err(VfsError::BusyCompacting)));
     assert!(matches!(v.lookup("big"), Err(VfsError::BusyCompacting)));
     assert!(matches!(v.alloc("n", 10), Err(VfsError::BusyCompacting)));
     assert!(matches!(v.delete("big"), Err(VfsError::BusyCompacting)));
@@ -591,7 +594,7 @@ fn compact_marks_bad_crc() {
     pwrite(&df, i2.offset, &[0u8; 64]).unwrap();
     drop(df);
 
-    v.compact(0).unwrap();
+    v.compact_with(0, None, None, 0).unwrap();
     wait_idle(&v);
     assert!(matches!(v.lookup("f2"), Err(VfsError::NotFound))); // Finalize 剔除
     let i1 = v.lookup("f1").unwrap();
@@ -614,7 +617,7 @@ fn compact_twice_with_reopen() {
         seq_write(&v, "f2", &mk(2)).unwrap();
         seq_write(&v, "f3", &mk(3)).unwrap();
         v.delete("f2").unwrap();
-        v.compact(0).unwrap();
+        v.compact_with(0, None, None, 0).unwrap();
         wait_idle(&v);
     }
     {
@@ -624,7 +627,7 @@ fn compact_twice_with_reopen() {
         let raw = data_of(&td.0);
         assert_eq!(&raw[4096..8192], &mk(3)[..]);
         v.delete("f1").unwrap();
-        v.compact(0).unwrap();
+        v.compact_with(0, None, None, 0).unwrap();
         wait_idle(&v);
     }
     let v = Vfs::open(&td.0).unwrap();

@@ -4,7 +4,6 @@ use std::collections::BinaryHeap;
 fn t(seq: u64) -> Arc<TaskShared> {
     Arc::new(TaskShared::new(
         seq,
-        format!("f{seq}"),
         format!("r{seq}"),
         String::new(),
         1,

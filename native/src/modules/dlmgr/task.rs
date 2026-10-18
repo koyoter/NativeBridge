@@ -27,7 +27,6 @@ pub(crate) const ERR_BUSY: i32 = 7;
 /// 任务共享态：入队后 worker / reporter / FFI 三方仅做原子读写，无逐字段锁。
 pub(crate) struct TaskShared {
     pub(crate) id: u64,
-    pub(crate) name: String,
     pub(crate) range_url: String,
     pub(crate) full_url: String, // 空 = 无兜底可用
     pub(crate) size: u64,
@@ -43,7 +42,6 @@ pub(crate) struct TaskShared {
 impl TaskShared {
     pub(crate) fn new(
         id: u64,
-        name: String,
         range_url: String,
         full_url: String,
         size: u64,
@@ -53,7 +51,6 @@ impl TaskShared {
     ) -> TaskShared {
         TaskShared {
             id,
-            name,
             range_url,
             full_url,
             size,

@@ -41,7 +41,6 @@ fn set_priority_reorders_queue() {
     let mk = |id: u64| {
         Arc::new(TaskShared::new(
             id,
-            format!("t{id}"),
             "r".into(),
             String::new(),
             1,

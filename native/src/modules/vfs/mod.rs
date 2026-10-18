@@ -291,7 +291,8 @@ impl VfsShared {
 
 /// 索引落盘共用体：fsync files.vfs → build_region → persist_image（含翻转）。
 /// `Vfs::flush`（拒绝整理中）与整理 Move 前的落盘共用；不做 compacting 检查。
-pub(crate) fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
+/// 模块私有：VfsShared 本就是 vfs 私有类型，不得超出本模块可见。
+fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
     let (mut entries, names, gen, logical) = {
         let g = shared.inner.lock().unwrap();
         (
@@ -730,10 +731,6 @@ impl Vfs {
     }
 
     /// 异步碎片整理（§2.3）。有 writer → BUSY_WRITERS；整理中 → BUSY_COMPACTING。
-    pub(crate) fn compact(&self, reserve_extra: u64) -> Result<(), VfsError> {
-        self.compact_with(reserve_extra, None, None, 0)
-    }
-
     pub(crate) fn compact_with(
         &self,
         reserve_extra: u64,
