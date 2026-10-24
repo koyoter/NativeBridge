@@ -62,8 +62,12 @@ fn clamp_native_long(unsigned_ok: bool, value: i64) -> Option<c_long> {
     if mem::size_of::<c_long>() == mem::size_of::<i64>() {
         return Some(value as c_long);
     }
-    let min = i64::from(c_long::MIN);
-    let max = i64::from(c_long::MAX);
+    // c_long/i64 平台相关（LP64 同型、LLP64/ILP32 收窄）：显式转换总在其中
+    // 一侧被判"冗余"，按别名语义豁免（min/max 的值语义两平台一致）。
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    let min = c_long::MIN as i64;
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    let max = c_long::MAX as i64;
     if value < min {
         return None;
     }
