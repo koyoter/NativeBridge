@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+use std::os::unix::io::AsRawFd;
 
 // --- CRC-32（IEEE 802.3 reflected，poly 0xEDB88320，与 zlib crc32 一致）---
 
@@ -70,6 +72,23 @@ pub(crate) fn pwrite(f: &File, off: u64, buf: &[u8]) -> std::io::Result<()> {
     {
         f.write_all_at(buf, off)
     }
+}
+
+// --- 平台强同步：苹果平台的 sync_all 只保证写入 page cache（断电仍可能丢），
+// F_FULLFSYNC 才真正冲盘（设计 §2.2 flush 的 macOS 要求）。vfs 容器与 dlmgr
+// 文件 sink 的崩溃持久性统一走这里。
+pub(crate) fn fsync_full(f: &File) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    {
+        // SAFETY: fd 取自存活的 File；F_FULLFSYNC 无内存安全前置条件，-1 转 io::Error。
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    f.sync_all()
 }
 
 #[cfg(test)]

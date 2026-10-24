@@ -33,8 +33,8 @@ use std::os::windows::fs::FileExt;
 use format::{Entry, SlotScan, SB_GEN_OFF, SB_SIZE, ST_ACTIVE, ST_DELETED, ST_DOWNLOADING};
 use index::Index;
 
-// pwrite 平台实现与 vfs/dlmgr 共用（modules/util.rs）。
-pub(crate) use crate::modules::util::pwrite;
+// pwrite / fsync_full 平台实现与 vfs/dlmgr 共用（modules/util.rs）。
+pub(crate) use crate::modules::util::{fsync_full, pwrite};
 
 // --- 错误码（§2.4 顺序）---
 pub(crate) const VFS_OK: i32 = 0; // IO=1 ...（其余见 VfsError::as_i32）
@@ -267,9 +267,9 @@ impl VfsShared {
             }
         }
         layout.append_end = layout.append_end.max(dest.off + dest.len);
-        hf.sync_all().map_err(ioerr)?;
+        fsync_full(&hf).map_err(ioerr)?;
         pwrite(&hf, SB_GEN_OFF, &format::sb_patch(gen)).map_err(ioerr)?;
-        hf.sync_all().map_err(ioerr)?;
+        fsync_full(&hf).map_err(ioerr)?;
         let old = layout.active;
         layout.active = dest;
         layout.free.retain(|s| s.off != dest.off);
@@ -304,7 +304,7 @@ fn flush_image(shared: &VfsShared) -> Result<(), VfsError> {
             g.idx.logical,
         )
     };
-    shared.data_file.lock().unwrap_or_else(PoisonError::into_inner).sync_all().map_err(ioerr)?;
+    fsync_full(&shared.data_file.lock().unwrap_or_else(PoisonError::into_inner)).map_err(ioerr)?;
     let img = format::build_region(gen, logical, &mut entries, &names);
     shared.persist_image(gen, &img.bytes)
 }
@@ -453,7 +453,7 @@ impl Vfs {
                 buf.extend_from_slice(&img.bytes);
                 header_file.set_len(0).map_err(ioerr)?;
                 pwrite(&header_file, 0, &buf).map_err(ioerr)?;
-                header_file.sync_all().map_err(ioerr)?;
+                fsync_full(&header_file).map_err(ioerr)?;
                 (
                     1,
                     0,
@@ -475,7 +475,7 @@ impl Vfs {
         // 物理小于逻辑（外部截断）则补齐；逻辑之外的物理残留忽略。
         if header_file.metadata().map_err(ioerr)?.len() != layout.append_end {
             header_file.set_len(layout.append_end).map_err(ioerr)?;
-            header_file.sync_all().map_err(ioerr)?;
+            fsync_full(&header_file).map_err(ioerr)?;
         }
         if physical < logical {
             data_file.set_len(logical).map_err(ioerr)?;

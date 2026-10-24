@@ -29,6 +29,7 @@ use super::format::{self, Entry, ST_ACTIVE, ST_BAD};
 use super::{
     ioerr, VfsError, VfsShared, COMPACT_FINALIZE, COMPACT_IDLE, COMPACT_MOVE, COMPACT_SCAN,
 };
+use crate::modules::util::fsync_full;
 
 /// Move 分块大小（~4MB）。
 const CHUNK: usize = 4 << 20;
@@ -283,7 +284,7 @@ fn compact_run(
             .checked_add(reserve_extra)
             .ok_or(VfsError::InvalidArg)?;
         // 数据先行落盘（§2.3 顺序：fsync files.vfs → 一次性翻转 → 截断/预扩容）。
-        if wr.sync_all().is_err() {
+        if fsync_full(&wr).is_err() {
             return Err(VfsError::Io);
         }
         let new_gen = old_gen.checked_add(1).ok_or(VfsError::WriteOverflow)?;

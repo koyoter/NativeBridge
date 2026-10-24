@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use libc::c_void;
 
-use crate::modules::util::pwrite;
+use crate::modules::util::{fsync_full, pwrite};
 
 /// C ABI 函数指针表（glue 以此桥接 vfs；dlmgr 只认这张表，不认识 vfs）。
 #[repr(C)]
@@ -138,7 +138,7 @@ unsafe extern "C" fn fs_reset(ctx: *mut c_void) -> i32 {
 
 unsafe extern "C" fn fs_finish(ctx: *mut c_void) -> i32 {
     let fs = &*(ctx as *const FileSink);
-    match fs.file.sync_all() {
+    match fsync_full(&fs.file) {
         Ok(()) => 0,
         Err(_) => -1,
     }
