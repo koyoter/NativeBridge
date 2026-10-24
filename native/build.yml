@@ -4,7 +4,7 @@
 # `local: true` and calls patch1.ps1 to stage the Rust sources into buildsrc/nativebridge
 # instead of calling fetch.ps1. It is built last, so every dependency's
 # $<lib>_install_dir global is already set and available to build1.ps1.
-ver: 0.1.0
+ver: 0.1.1-rc.2
 local: true
 cb_tool: custom
 
