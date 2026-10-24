@@ -539,6 +539,40 @@ jobs:
       - name: Assemble NativeBridge package
         shell: bash
         run: bash pack/dist1.sh "$VERSION" --require-all
+      - name: Assert package contents (T6)
+        shell: bash
+        run: |
+          list="$(unzip -l "$NB_DIST_ZIP" | awk '{print $4}')"
+          missing=0
+          check() {
+            echo "$list" | grep -qx "$1" || { echo "::error::zip missing $1"; missing=1; }
+          }
+          # C# 绑定三件套 + asmdef（T6: 产物包含 Vfs.cs/DownloadManager.cs）
+          for f in Runtime/Curlw.cs Runtime/Curlw.cs.meta \
+                   Runtime/Vfs.cs Runtime/Vfs.cs.meta \
+                   Runtime/DownloadManager.cs Runtime/DownloadManager.cs.meta \
+                   Runtime/NativeBridgeF.asmdef package.json; do
+            check "$f"
+          done
+          # 各平台原生库（T6: 构建矩阵冒烟的产物侧断言）
+          for f in Plugins/Windows/x86_64/NativeBridge.dll \
+                   Plugins/Windows/ARM64/NativeBridge.dll \
+                   Plugins/Linux/x86_64/libNativeBridge.so \
+                   Plugins/Linux/ARM64/libNativeBridge.so \
+                   Plugins/Android/arm64-v8a/libNativeBridge.so \
+                   Plugins/Android/armeabi-v7a/libNativeBridge.so \
+                   Plugins/Android/x86_64/libNativeBridge.so \
+                   Plugins/Android/x86/libNativeBridge.so \
+                   Plugins/macOS/NativeBridge.dylib; do
+            check "$f"
+          done
+          # iOS/tvOS xcframework：真机 + 模拟器静态库切片各就各位
+          echo "$list" | grep -q '^Plugins/iOS/NativeBridge.xcframework/.*\.a$' \
+            || { echo "::error::zip missing iOS .a slice"; missing=1; }
+          echo "$list" | grep -q '^Plugins/tvOS/NativeBridge.xcframework/.*\.a$' \
+            || { echo "::error::zip missing tvOS .a slice"; missing=1; }
+          [ "$missing" = 0 ] || exit 1
+          echo "package contents OK ($(echo "$list" | grep -c .) entries)"
       - name: Upload package artifact
         uses: actions/upload-artifact@v6
         with:

@@ -926,6 +926,190 @@ namespace NativeBridgeF.Tests
             }
         }
 
+        // --- 杀进程重启（T6 手动验证，由 csharp/killrecovery.ps1 驱动）--------------------
+        // 固定目录让两个独立进程共享 VFS 状态；NB_KILL_RECOVERY 未设时跳过（CI 永不触发）。
+        // 语义依据：commit 仅内存可见，flush 才是耐久边界（§2.2）；重开时 Downloading
+        // 残留条目丢弃、数据成垃圾（§2.2 open）。
+
+        private static string KillRecoveryDir()
+        {
+            return Path.Combine(Path.GetTempPath(), "nb-kill-recovery");
+        }
+
+        /// <summary>
+        /// stage1：两个快任务下载完成并 flush（耐久边界），慢任务仍在下载时宿主
+        /// 挂住等死——被脚本整树杀掉后，磁盘上留下：已 flush 的 Active 条目 +
+        /// 慢任务的半截数据（Downloading 残留）。
+        /// </summary>
+        [Test]
+        public void KillRecovery_Stage1_DownloadFlushThenHang()
+        {
+            if (Environment.GetEnvironmentVariable("NB_KILL_RECOVERY") == null)
+            {
+                Assert.Ignore("杀进程重启手动验证：由 csharp/killrecovery.ps1 驱动（设 NB_KILL_RECOVERY=1 可直跑）");
+            }
+            string dir = KillRecoveryDir();
+            Directory.CreateDirectory(dir);
+            byte[] fast = TestPaths.Content(256 * 1024, 41);
+            byte[] slow = TestPaths.Content(4 * 1024 * 1024, 42);
+            string fastUrl = _server.Add("kr-fast.bin", fast);
+            string slowUrl = _server.Add("kr-slow.bin", slow, slowMs: 40, chunk: 16 * 1024);
+
+            IntPtr h = VfsDLL.vfs_open_paths(
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "header.vfs")),
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "files.vfs")));
+            Assert.That(h, Is.Not.EqualTo(IntPtr.Zero));
+            var sinks = new ulong[3];
+            try
+            {
+                sinks[0] = DlVfs.dlvfs_sink_create_for_vfs(h, "kr-a", (ulong)fast.Length);
+                sinks[1] = DlVfs.dlvfs_sink_create_for_vfs(h, "kr-b", (ulong)fast.Length);
+                sinks[2] = DlVfs.dlvfs_sink_create_for_vfs(h, "kr-slow", (ulong)slow.Length);
+                ulong a = Enqueue(fastUrl, null, "kr-a", (ulong)fast.Length,
+                                  TestPaths.Crc32(fast), sinks[0]);
+                ulong b = Enqueue(fastUrl, null, "kr-b", (ulong)fast.Length,
+                                  TestPaths.Crc32(fast), sinks[1]);
+                ulong s = Enqueue(slowUrl, null, "kr-slow", (ulong)slow.Length,
+                                  TestPaths.Crc32(slow), sinks[2]);
+
+                WaitAllTerminal(new[] { a, b }, 60_000);
+                VfsDLL.vfs_flush(h); // 耐久边界：两个 commit 落进 header
+                File.WriteAllText(Path.Combine(dir, "stage1.ready"), "ok");
+                WaitState(s, (int)DlmgrTaskState.Running, 15_000);
+                // 慢任务下载中挂住等死（模拟宿主运行中被杀）；被杀则 finally 不执行。
+                Thread.Sleep(Timeout.Infinite);
+            }
+            finally
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    if (sinks[i] != 0) DlmgrDLL.dlmgr_sink_release(sinks[i]);
+                }
+                VfsDLL.vfs_flush(h);
+                VfsDLL.vfs_close(h);
+            }
+        }
+
+        /// <summary>
+        /// stage2（杀进程后重启）：重开同一 VFS——已 flush 的两个文件 Active 且
+        /// 逐字节完好；慢任务条目不在（Downloading 残留被清理）；可重新整理。
+        /// </summary>
+        [Test]
+        public void KillRecovery_Stage2_VerifyRecovery()
+        {
+            if (Environment.GetEnvironmentVariable("NB_KILL_RECOVERY") == null)
+            {
+                Assert.Ignore("杀进程重启手动验证：由 csharp/killrecovery.ps1 驱动（设 NB_KILL_RECOVERY=1 可直跑）");
+            }
+            string dir = KillRecoveryDir();
+            Assert.That(File.Exists(Path.Combine(dir, "stage1.ready")), Is.True, "先跑 stage1");
+            byte[] fast = TestPaths.Content(256 * 1024, 41);
+
+            IntPtr h = VfsDLL.vfs_open_paths(
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "header.vfs")),
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "files.vfs")));
+            Assert.That(h, Is.Not.EqualTo(IntPtr.Zero));
+            try
+            {
+                // 已 flush 的 commit 文件完好 Active
+                foreach (string name in new[] { "kr-a", "kr-b" })
+                {
+                    int err = VfsDLL.vfs_lookup(h, DlmgrDLL.Utf8Bytes(name),
+                                                out _, out ulong size, out int state, out uint crc);
+                    Assert.That(err, Is.EqualTo((int)VfsResult.OK), name + " 应存在");
+                    Assert.That((VfsFileState)state, Is.EqualTo(VfsFileState.Active), name + " 应 Active");
+                    Assert.That(size, Is.EqualTo((ulong)fast.Length));
+                    Assert.That(crc, Is.EqualTo(TestPaths.Crc32(fast)));
+                }
+                // 慢任务（Downloading 残留）被清理：条目不可见
+                int errSlow = VfsDLL.vfs_lookup(h, DlmgrDLL.Utf8Bytes("kr-slow"),
+                                                out _, out _, out _, out _);
+                Assert.That(errSlow, Is.EqualTo((int)VfsResult.NotFound), "Downloading 残留应被丢弃");
+
+                // 可重新整理（崩溃矩阵 §2.3 的 Finalize 语义）
+                using (var done = new ManualResetEventSlim(false))
+                {
+                    int compactErr = int.MinValue;
+                    VfsDoneDelegate onDone = (user, err2) => { compactErr = err2; done.Set(); };
+                    int rc = VfsDLL.vfs_compact(h, 0, null, onDone, IntPtr.Zero);
+                    Assert.That(rc, Is.EqualTo((int)VfsResult.OK), "compact 应可启动");
+                    Assert.That(done.Wait(60_000), Is.True, "整理回调超时");
+                    Assert.That(compactErr, Is.EqualTo((int)VfsResult.OK), "重启后必须可重新整理");
+                }
+            }
+            finally
+            {
+                VfsDLL.vfs_flush(h);
+                VfsDLL.vfs_close(h);
+            }
+
+            using (var reader = VfsReader.Open(dir))
+            {
+                reader.RefreshIndex();
+                reader.EnsureMapping();
+                foreach (string name in new[] { "kr-a", "kr-b" })
+                {
+                    Assert.That(reader.TryReadBytes(name, out byte[] got), Is.True, name);
+                    Assert.That(got, Is.EqualTo(fast), name + " 逐字节完好");
+                }
+            }
+            try { Directory.Delete(dir, true); } catch { }
+        }
+
+        /// <summary>
+        /// 测试重点：预扩容语义（T6）——下载期间 files.vfs 物理大小恒定
+        /// （alloc 时 set_len 一次性预留），边写边采样 vfs_stat 断言不变，
+        /// Done 后仍不变（整理前的物理大小只增不因写入变化）。
+        /// </summary>
+        [Test]
+        public void DownloadIntoVfs_PhysicalSizeStableDuringWrite()
+        {
+            byte[] data = TestPaths.Content(2 * 1024 * 1024, 43);
+            string url = _server.Add("phys.bin", data, slowMs: 20, chunk: 16 * 1024);
+            string dir = TestPaths.NewDir();
+
+            IntPtr h = VfsDLL.vfs_open_paths(
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "header.vfs")),
+                DlmgrDLL.Utf8Bytes(Path.Combine(dir, "files.vfs")));
+            Assert.That(h, Is.Not.EqualTo(IntPtr.Zero));
+            ulong sink = DlVfs.dlvfs_sink_create_for_vfs(h, "phys.bin", (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                ulong id = Enqueue(url, null, "phys.bin", (ulong)data.Length,
+                                   TestPaths.Crc32(data), sink);
+                WaitState(id, (int)DlmgrTaskState.Running, 15_000);
+
+                ulong prevPhysical = 0;
+                for (int sample = 0; sample < 3; sample++)
+                {
+                    Assert.That(VfsDLL.vfs_stat(h, out _, out ulong physical, out _,
+                                                out _, out _, out _),
+                                Is.EqualTo((int)VfsResult.OK));
+                    if (sample > 0)
+                    {
+                        Assert.That(physical, Is.EqualTo(prevPhysical),
+                                    "下载期间物理大小必须恒定（alloc 已一次性预留）");
+                    }
+                    prevPhysical = physical;
+                    Thread.Sleep(300);
+                }
+                Record r = WaitTerminal(id, TerminalMs);
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "应为 Done, err=" + r.Err);
+                Assert.That(VfsDLL.vfs_stat(h, out _, out ulong finalPhysical, out _,
+                                            out _, out _, out _),
+                            Is.EqualTo((int)VfsResult.OK));
+                Assert.That(finalPhysical, Is.EqualTo(prevPhysical), "Done 后物理大小不变");
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_sink_release(sink);
+                VfsDLL.vfs_flush(h);
+                VfsDLL.vfs_close(h);
+            }
+            try { Directory.Delete(dir, true); } catch { }
+        }
+
         /// <summary>
         /// 测试重点：dlmgr + VFS sink 端到端（T6 胶水场景）——下载经
         /// dlvfs_sink_create_for_vfs 直写 VFS 容器：终态 Done 后条目立即
