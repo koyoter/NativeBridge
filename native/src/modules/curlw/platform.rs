@@ -45,12 +45,16 @@ pub(super) struct RawLock {
 impl RawLock {
     pub(super) fn new() -> Option<Self> {
         #[cfg(windows)]
+        // SAFETY: 全零 CRITICAL_SECTION 是 InitializeCriticalSection 的合法输入
+        // （Win32 文档契约），调用后 cs 方为可用锁。
         unsafe {
             let mut cs = Box::new(mem::zeroed::<CRITICAL_SECTION>());
             InitializeCriticalSection(&mut *cs);
             Some(Self { cs })
         }
         #[cfg(not(windows))]
+        // SAFETY: 全零 pthread_mutex_t 是 pthread_mutex_init 的合法输入；
+        // 返回码检查，失败即不构造。
         unsafe {
             let mut mtx = Box::new(mem::zeroed::<pthread_mutex_t>());
             if libc::pthread_mutex_init(&mut *mtx, ptr::null()) != 0 {
@@ -62,10 +66,13 @@ impl RawLock {
 
     fn lock(&self) {
         #[cfg(windows)]
+        // SAFETY: cs 经 new() 完成初始化且未被 Drop；const→mut 转换是 Win32
+        // LPCRITICAL_SECTION 签名所需；lock/unlock 由 share_lock/share_unlock 配对。
         unsafe {
             EnterCriticalSection(&*self.cs as *const _ as *mut _);
         }
         #[cfg(not(windows))]
+        // SAFETY: mtx 经 new() 完成初始化且未被 Drop；lock/unlock 成对调用。
         unsafe {
             libc::pthread_mutex_lock(&*self.mtx as *const _ as *mut _);
         }
@@ -73,10 +80,12 @@ impl RawLock {
 
     fn unlock(&self) {
         #[cfg(windows)]
+        // SAFETY: 同 lock()——已初始化的 cs，且本次 unlock 与一次 lock 配对。
         unsafe {
             LeaveCriticalSection(&*self.cs as *const _ as *mut _);
         }
         #[cfg(not(windows))]
+        // SAFETY: 同 lock()——已初始化的 mtx，unlock 与持有它的线程上的 lock 配对。
         unsafe {
             libc::pthread_mutex_unlock(&*self.mtx as *const _ as *mut _);
         }
@@ -86,17 +95,22 @@ impl RawLock {
 impl Drop for RawLock {
     fn drop(&mut self) {
         #[cfg(windows)]
+        // SAFETY: cs 已初始化；Drop 发生在 share 清理之后，不再有线程持锁。
         unsafe {
             DeleteCriticalSection(&mut *self.cs);
         }
         #[cfg(not(windows))]
+        // SAFETY: mtx 已初始化；Drop 时无持锁者（share 清理先于 Drop）。
         unsafe {
             libc::pthread_mutex_destroy(&mut *self.mtx);
         }
     }
 }
 
+// SAFETY: 互斥体（CRITICAL_SECTION / pthread_mutex_t）本身就是跨线程 lock/unlock
+// 的原语，裸指针仅指向 Box 固定地址；Rust 类型系统看不见 Win32/pthread 契约。
 unsafe impl Send for RawLock {}
+// SAFETY: 同上：&self 上的 lock/unlock 即为多线程共享的预期用法。
 unsafe impl Sync for RawLock {}
 
 pub(super) struct ShareLockSet {
@@ -149,11 +163,14 @@ impl FdSetPool {
             let count = inner.chunk_size;
             let mut sets = Vec::with_capacity(count);
             for _ in 0..count {
+                // SAFETY: fd_set 为纯位图结构，全零即"空集"，是合法表示。
                 sets.push(unsafe { mem::zeroed::<fd_set>() });
             }
             let sets = sets.into_boxed_slice();
             let base = sets.as_ptr() as *mut fd_set;
             for i in 0..count {
+                // SAFETY: i < count，base..base+count 恰为刚分配的 boxed slice
+                // 范围；块由 inner.blocks 持有存活。
                 inner.free_list.push(unsafe { base.add(i) });
             }
             inner.blocks.push(sets);
@@ -170,7 +187,10 @@ impl FdSetPool {
     }
 }
 
+// SAFETY: 裸指针仅作为池内句柄传递，不构成 Rust 可变共享；所有池操作都在
+// inner Mutex 下串行，块存活期由 blocks Vec 保证。
 unsafe impl Send for FdSetPool {}
+// SAFETY: 同 Send：&self 上的 allocate/deallocate 全部经 Mutex 串行。
 unsafe impl Sync for FdSetPool {}
 
 pub(super) static GLOBAL_MTX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -254,7 +274,7 @@ pub(super) unsafe extern "C" fn share_lock(
     if userptr.is_null() {
         return;
     }
-    if data < 0 || data >= CURL_LOCK_DATA_LAST {
+    if !(0..CURL_LOCK_DATA_LAST).contains(&data) {
         return;
     }
     let lock_set = &*(userptr as *const ShareLockSet);
@@ -269,7 +289,7 @@ pub(super) unsafe extern "C" fn share_unlock(
     if userptr.is_null() {
         return;
     }
-    if data < 0 || data >= CURL_LOCK_DATA_LAST {
+    if !(0..CURL_LOCK_DATA_LAST).contains(&data) {
         return;
     }
     let lock_set = &*(userptr as *const ShareLockSet);

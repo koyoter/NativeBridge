@@ -329,15 +329,18 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
     // "入队 → active_count==0 → 整理"的时序会让排队任务撞上整理窗口，此前一律
     // 折成 NETWORK 冤死且错误码误导；重试仍整理中 → ERR_BUSY。
     const PREPARE_BUSY: i32 = 4; // VfsError::BusyCompacting.as_i32()（sink vtable 透传）
+    // SAFETY: vt 与 ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约：终态后才 release）。
     let mut rc = unsafe { (vt.prepare)(vt.ctx, task.size) };
     if rc == PREPARE_BUSY {
         for wait in [1_000u64, 2_000, 4_000] {
             if task.cancel.load(Ordering::Relaxed) {
+                // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                 unsafe { (vt.abort)(vt.ctx) };
                 terminal(task, true, ERR_CANCELED);
                 return;
             }
             std::thread::sleep(Duration::from_millis(wait));
+            // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
             rc = unsafe { (vt.prepare)(vt.ctx, task.size) };
             if rc != PREPARE_BUSY {
                 break;
@@ -345,6 +348,7 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
         }
     }
     if rc != 0 {
+        // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
         unsafe { (vt.abort)(vt.ctx) };
         terminal(task, false, if rc == PREPARE_BUSY { ERR_BUSY } else { ERR_NETWORK });
         return;
@@ -352,10 +356,12 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
 
     // 空文件短路：crc32(∅) == 0，直接校验落定
     if task.size == 0 {
+        // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
         if task.crc == 0 && unsafe { (vt.finish)(vt.ctx) } == 0 {
             task.err.store(ERR_OK, Ordering::Relaxed);
             task.state.store(TASK_DONE, Ordering::Release);
         } else {
+            // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
             unsafe { (vt.abort)(vt.ctx) };
             terminal(task, false, ERR_CRC_MISMATCH);
         }
@@ -374,6 +380,7 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
 
     loop {
         if task.cancel.load(Ordering::Relaxed) {
+            // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
             unsafe { (vt.abort)(vt.ctx) };
             terminal(task, true, ERR_CANCELED);
             return;
@@ -399,10 +406,12 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
         match transition(&mut st, &out, task.size, sh.retry_count) {
             Decision::Done => {
                 task.state.store(TASK_VERIFYING, Ordering::Relaxed);
+                // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                 if unsafe { (vt.finish)(vt.ctx) } == 0 {
                     task.err.store(ERR_OK, Ordering::Relaxed);
                     task.state.store(TASK_DONE, Ordering::Release);
                 } else {
+                    // SAFETY: 同上。
                     unsafe { (vt.abort)(vt.ctx) };
                     terminal(task, false, ERR_NETWORK);
                 }
@@ -410,6 +419,7 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
             }
             Decision::Resume => {
                 if !backoff_wait(task, st.retries) {
+                    // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                     unsafe { (vt.abort)(vt.ctx) };
                     terminal(task, true, ERR_CANCELED);
                     return;
@@ -418,6 +428,7 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
             }
             Decision::RestartFromZero => {
                 if !backoff_wait(task, st.retries) {
+                    // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                     unsafe { (vt.abort)(vt.ctx) };
                     terminal(task, true, ERR_CANCELED);
                     return;
@@ -426,6 +437,7 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
                     // full 阶段从头重下：清掉上次的半截数据。
                     // reset 失败可容忍：FileSink 后续 pwrite 从 0 全量覆盖（已收字节
                     // ≤ size 必被覆盖），glue VfsSink 的 reset 恒为 no-op 成功。
+                    // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                     unsafe { (vt.reset)(vt.ctx) };
                     off = 0;
                     crc = 0;
@@ -437,17 +449,20 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
                 st.range_phase = false;
                 st.last_err = kind;
                 if task.full_url.is_empty() {
+                    // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                     unsafe { (vt.abort)(vt.ctx) }; // 无兜底可用
                     terminal(task, false, kind);
                     return;
                 }
                 // 同上，reset 失败可容忍（从 0 全量覆盖）。
+                // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                 unsafe { (vt.reset)(vt.ctx) }; // 从 0 重下（不消耗重试）
                 off = 0;
                 crc = 0;
                 task.bytes_done.store(0, Ordering::Relaxed);
             }
             Decision::Fail(err) => {
+                // SAFETY: vt/ctx 由 sink 注册表同源发放，条目存活至终态上报（宿主契约）。
                 unsafe { (vt.abort)(vt.ctx) };
                 terminal(task, err == ERR_CANCELED, err);
                 return;
@@ -459,6 +474,8 @@ fn run_task(sh: &Shared, easy: &Easy, task: &Arc<TaskShared>) {
 /// 单次连接：按阶段设 URL / Range 头 / 写回调，perform 后汇总为 AttemptOutcome。
 /// `off` 入参为本次请求起始偏移，出参回传实际收到的累计偏移（断点续传的下一拍
 /// 请求 `Range: bytes={off}-` 依赖它——不回传则 Resume 永远从 0 重收、crc 必然翻车）。
+// 内部单调用点管线：参数即一次 attempt 的全部输入输出，不因 lint 聚合成包装结构。
+#[allow(clippy::too_many_arguments)]
 fn perform_attempt(
     sh: &Shared,
     task: &TaskShared,

@@ -60,7 +60,7 @@ pub(crate) fn build_plan(
     mut actives: Vec<(String, Entry)>,
     old_logical: u64,
 ) -> Result<Plan, VfsError> {
-    if old_logical % format::ALIGN != 0 {
+    if !old_logical.is_multiple_of(format::ALIGN) {
         return Err(VfsError::InvalidArg);
     }
     actives.sort_by_key(|(_, e)| e.offset);
@@ -173,6 +173,8 @@ fn run(
     }
     shared.ctl.state.store(COMPACT_IDLE, Ordering::Relaxed);
     if let Some(f) = done {
+        // SAFETY: f 为宿主在 vfs_compact 注册的非空 fn 指针，user 以 usize 原值回传；
+        // 二者由宿主 keep-alive 契约保证在句柄存活期内有效（回调只触发这一次）。
         unsafe { f(user as *mut c_void, code as c_int) };
     }
 }
@@ -334,6 +336,8 @@ fn copy_verified(
 fn fire_progress(progress: Option<ProgressCb>, user: usize, percent: c_int, name: &str) {
     if let Some(f) = progress {
         let c = std::ffi::CString::new(name).unwrap_or_default();
+        // SAFETY: f/user 由宿主 keep-alive 保证在整理期间有效；name 指向本
+        // 调用内存活的 CString（NUL 结尾），回调返回前不会释放。
         unsafe { f(user as *mut c_void, percent, c.as_ptr()) };
     }
 }

@@ -89,13 +89,18 @@ pub(crate) fn version_components() -> (String, String, String) {
         if p.is_null() {
             "?".to_string()
         } else {
+            // SAFETY: p 已判非空，指向 curl_version_info 返回的 libcurl 静态
+            // NUL 结尾字符串（进程生命期有效）。
             unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
         }
     };
+    // SAFETY: 纯查询 FFI，无前置条件；返回指针随即判空。
     let v = unsafe { curl_version_info(CURLVERSION_NOW) };
     if v.is_null() {
         ("?".to_string(), "?".to_string(), "?".to_string())
     } else {
+        // SAFETY: v 已判非空，指向 libcurl 静态的 curl_version_info_data；
+        // version/ssl_version/nghttp2_version 均为该结构最早期的必有字段。
         let d = unsafe { &*v };
         (field(d.version), field(d.ssl_version), field(d.nghttp2_version))
     }
@@ -1126,12 +1131,12 @@ pub unsafe extern "C" fn curlw_wsframe_flags(f: *const curl_ws_frame) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn curlw_wsframe_offset(f: *const curl_ws_frame) -> i64 {
-    if f.is_null() { 0 } else { (*f).offset as i64 }
+    if f.is_null() { 0 } else { (*f).offset }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn curlw_wsframe_bytesleft(f: *const curl_ws_frame) -> i64 {
-    if f.is_null() { 0 } else { (*f).bytesleft as i64 }
+    if f.is_null() { 0 } else { (*f).bytesleft }
 }
 
 #[no_mangle]

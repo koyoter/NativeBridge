@@ -14,8 +14,12 @@ fn internal_thread_guard_restores_identity_and_rejects_any_manager() {
         assert_eq!(INTERNAL_MANAGER.with(Cell::get), Arc::as_ptr(&first));
         // Neither manager has any stored JoinHandles. Rejection must not
         // depend on handle publication or consume/mutate either manager.
+        // SAFETY: first_ptr 指向上面 Box 内存活的 Arc<Shared>；当前线程在
+        // InternalThreadGuard 内，shutdown_try 必走拒绝路径不消费句柄。
         assert_eq!(unsafe { dlmgr_shutdown_try(first_ptr) }, -1);
+        // SAFETY: 同上——second_ptr 指向存活 Arc，拒绝路径。
         assert_eq!(unsafe { dlmgr_shutdown_try(second_ptr) }, -1);
+        // SAFETY: 同上：first_ptr 存活；legacy void 版在 guard 内同样拒绝（无返回码）。
         unsafe { dlmgr_shutdown(first_ptr) }; // legacy void ABI must also no-op
         assert!(!first.queue.lock().unwrap().shutdown);
         assert!(!second.queue.lock().unwrap().shutdown);
@@ -30,6 +34,7 @@ fn internal_thread_guard_restores_identity_and_rejects_any_manager() {
     assert!(INTERNAL_MANAGER.with(|current| current.get().is_null()));
     assert_eq!(Arc::strong_count(&first), 2);
     assert_eq!(Arc::strong_count(&second), 2);
+    // SAFETY: null 句柄是文档化的"成功 no-op"路径。
     assert_eq!(unsafe { dlmgr_shutdown_try(ptr::null_mut()) }, 0);
 }
 

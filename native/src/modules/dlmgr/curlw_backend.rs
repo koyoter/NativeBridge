@@ -66,11 +66,14 @@ impl Easy {
         ca: Option<&[u8]>,
         http_version: i64,
     ) -> Option<Easy> {
+        // SAFETY: 无前置条件；init 仅创建新句柄，返回值随即判空。
         let h = unsafe { curlw_easy_init() };
         if h.is_null() {
             return None;
         }
         let e = Easy { h };
+        // SAFETY: h 已判非空且由本 Easy 独占持有；setopt 均为值参数（share 指针由
+        // manager 保活至 shutdown，建柄窗口内必然有效），返回码逐项检查。
         unsafe {
             if curlw_easy_setopt_long(h, CURLOPT_NOSIGNAL, 1) != CURLE_OK
                 || curlw_easy_setopt_pointer(h, CURLOPT_SHARE, share) != CURLE_OK
@@ -115,6 +118,7 @@ impl Easy {
     }
 
     pub(crate) fn cleanup(self) {
+        // SAFETY: self.h 由本 Easy 独占拥有且此刻有效（消费 self，不会二次释放）。
         unsafe { curlw_easy_cleanup(self.h) };
     }
 
@@ -124,6 +128,8 @@ impl Easy {
 
     fn set_string(&self, opt: i32, v: &str) -> bool {
         match CString::new(v) {
+            // SAFETY: self.h 由本 Easy 持有且有效；c 为 NUL 结尾 CString，libcurl
+            // setopt 按自身语义拷贝字符串，指针无需超出调用存活。
             Ok(c) => unsafe { curlw_easy_setopt_string(self.h, opt, c.as_ptr()) == CURLE_OK },
             Err(_) => false, // 内嵌 NUL 的非法 UTF-8 串
         }
@@ -134,6 +140,8 @@ impl Easy {
     }
 
     pub(crate) fn set_write_cb(&self, cb: WriteCb, ctx: *mut c_void) -> bool {
+        // SAFETY: self.h 有效；cb 为与 native 签名匹配的 fn 指针；ctx 指向调用方
+        // 保证在 perform 期间存活的 WriteCtx（worker 栈上锚定）。
         unsafe {
             // setopt_pointer 接受 functionpoint 选项（WRITEFUNCTION 属 20000 段）
             curlw_easy_setopt_pointer(self.h, CURLOPT_WRITEFUNCTION, cb as *mut c_void) == CURLE_OK
@@ -143,15 +151,19 @@ impl Easy {
 
     /// 挂自定义请求头；head 为 HeaderList::build 产物（None 传 null 清除）。
     pub(crate) fn set_header_list(&self, head: *mut c_void) -> bool {
+        // SAFETY: self.h 有效；head 由 HeaderList 持有存活到 perform 结束（_keep
+        // 保 CString，slist 节点由 append 分配、Drop 统一释放）。
         unsafe { curlw_easy_setopt_pointer(self.h, CURLOPT_HTTPHEADER, head) == CURLE_OK }
     }
 
     pub(crate) fn perform(&self) -> i32 {
+        // SAFETY: self.h 有效；写回调 ctx 指向本次 perform 存续期内的栈上 WriteCtx。
         unsafe { curlw_easy_perform(self.h) }
     }
 
     fn get_long(&self, info: i32) -> i64 {
         let mut v = 0i64;
+        // SAFETY: self.h 有效；info 属 CURLINFO_LONG 段，&mut v 为匹配的 i64 出参。
         unsafe { curlw_easy_getinfo_long(self.h, info, &mut v) };
         v
     }
@@ -171,6 +183,8 @@ impl Easy {
     pub(crate) fn content_range(&self) -> Option<(u64, u64)> {
         const NAME: &[u8] = b"Content-Range\0";
         let mut out: *mut c_void = ptr::null_mut();
+        // SAFETY: self.h 有效；NAME 为 NUL 结尾字面量；out 出参由 curl 填充，
+        // 所指内容归 curl 拥有、存活到下一次 header 调用。
         let ec = unsafe {
             curlw_easy_header(
                 self.h,
@@ -184,10 +198,12 @@ impl Easy {
         if ec != 0 || out.is_null() {
             return None;
         }
+        // SAFETY: out 为上一次 curlw_easy_header 刚返回的非空 curl 拥有指针。
         let val = unsafe { curlw_header_value(out as *const _) };
         if val.is_null() {
             return None;
         }
+        // SAFETY: val 已判非空，指向 curl 提供的 NUL 结尾 C 字符串。
         let s = unsafe { CStr::from_ptr(val) }.to_str().ok()?;
         let slash = s.rfind('/')?;
         let total: u64 = s[slash + 1..].trim().parse().ok()?;
@@ -215,6 +231,8 @@ impl HeaderList {
             // 例外位点（可证不失败）：Range 头由 format! 生成，无内部 NUL。
             #[allow(clippy::expect_used)]
             let c = CString::new(format!("Range: bytes={off}-")).expect("no interior NUL");
+            // SAFETY: c 为本函数存续期内存活的 NUL 结尾 CString；空表首 append
+            // 返回新链表头。
             unsafe {
                 head = curlw_slist_append(ptr::null_mut(), c.as_ptr()) as *mut c_void;
             }
@@ -227,6 +245,8 @@ impl HeaderList {
 impl Drop for HeaderList {
     fn drop(&mut self) {
         if !self.head.is_null() {
+            // SAFETY: head 已判非空，是 append 分配、由本结构独占的链表头，
+            // Drop 恰好释放一次。
             unsafe { curlw_slist_free_all(self.head as *mut _) };
         }
     }

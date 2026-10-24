@@ -268,7 +268,7 @@ fn scale_20k_entries() {
     {
         let v = Vfs::open(&td.0).unwrap();
         for i in 0..20_000u32 {
-            seq_write(&v, &format!("f{i}.bin"), &vec![i as u8; 16]).unwrap();
+            seq_write(&v, &format!("f{i}.bin"), &[i as u8; 16]).unwrap();
         }
         v.flush().unwrap();
     }
@@ -717,10 +717,10 @@ fn enumerate_gen_covers_alloc_abort_and_compact_blob() {
         v.enumerate_read(
             gen,
             &mut vec![0u8; blen as usize],
-            &mut vec![0u64; 2],
-            &mut vec![0u64; 2],
-            &mut vec![0u32; 2],
-            &mut vec![0u8; 2]
+            &mut [0u64; 2],
+            &mut [0u64; 2],
+            &mut [0u32; 2],
+            &mut [0u8; 2]
         ),
         Err(VfsError::GenChanged)
     ));
@@ -731,10 +731,10 @@ fn enumerate_gen_covers_alloc_abort_and_compact_blob() {
         v.enumerate_read(
             gen,
             &mut vec![0u8; blen as usize],
-            &mut vec![0u64; 2],
-            &mut vec![0u64; 2],
-            &mut vec![0u32; 2],
-            &mut vec![0u8; 2]
+            &mut [0u64; 2],
+            &mut [0u64; 2],
+            &mut [0u32; 2],
+            &mut [0u8; 2]
         ),
         Err(VfsError::GenChanged)
     ));
@@ -770,10 +770,13 @@ fn enumerate_gen_covers_alloc_abort_and_compact_blob() {
 fn close_flushes_pending_commits() {
     let td = TempDir::new();
     let dir = CString::new(td.0.to_str().unwrap()).unwrap();
+    // SAFETY: dir 为本测试存续期内存活的 NUL 结尾 CString。
     let h = unsafe { vfs_open(dir.as_ptr()) };
     assert!(!h.is_null());
+    // SAFETY: h 已判非空且来自成功的 vfs_open，指向 Box<Vfs>。
     let v = unsafe { (h as *const Vfs).as_ref().unwrap() };
     seq_write(v, "f1", &[1u8; 10]).unwrap(); // 不显式 flush
+    // SAFETY: h 为已打开且尚未关闭的有效句柄，close 恰好一次。
     unsafe { vfs_close(h) }; // 优雅 close：best-effort flush
     let v2 = Vfs::open(&td.0).unwrap();
     assert!(v2.lookup("f1").is_ok());
@@ -825,12 +828,16 @@ fn ffi_open_paths() {
     let td = TempDir::new();
     let i = CString::new(td.0.join("i.vfs").to_str().unwrap()).unwrap();
     let d = CString::new(td.0.join("d.vfs").to_str().unwrap()).unwrap();
+    // SAFETY: i/d 均为存活的 NUL 结尾 CString，且路径互异（合法参数）。
     let h = unsafe { vfs_open_paths(i.as_ptr(), d.as_ptr()) };
     assert!(!h.is_null());
+    // SAFETY: h 为有效句柄，close 恰好一次。
     unsafe { vfs_close(h) }; // 先 close：Windows 下打开的句柄会挡住 TempDir 清理
                              // 防呆经 FFI：同路径 → NULL（顺带钉死 index/data 参数顺序不颠倒）
     let same = CString::new(td.0.join("x.vfs").to_str().unwrap()).unwrap();
+    // SAFETY: same 为存活 CString；同路径是文档化 INVALID_ARG → 返回 NULL。
     assert!(unsafe { vfs_open_paths(same.as_ptr(), same.as_ptr()) }.is_null());
+    // SAFETY: null 索引路径是文档化 INVALID_ARG → 返回 NULL。
     assert!(unsafe { vfs_open_paths(ptr::null(), d.as_ptr()) }.is_null());
 }
 

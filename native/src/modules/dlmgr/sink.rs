@@ -25,7 +25,11 @@ pub(crate) struct SinkVTable {
     pub abort: unsafe extern "C" fn(ctx: *mut libc::c_void) -> i32, // 任务作废
 }
 // 注册表跨线程存取：ctx 由调用方保证生命周期（终态后才 release），函数指针只读。
+// SAFETY: Send：字段全为 Copy 的 fn 指针与非拥有的 ctx 裸指针，跨线程移动不解引用；
+// ctx 有效性由宿主契约保证——注册表项存活至任务终态上报后的 sink_release。
 unsafe impl Send for SinkVTable {}
+// SAFETY: Sync：无内部可变性，共享引用只读 fn 指针、拷贝指针值；ctx 的解引用
+// 经注册表句柄派发，每个 sink 归单个任务单个 worker 串行使用。
 unsafe impl Sync for SinkVTable {}
 
 /// 注册表条目：vtable + 可选析构（FileSink 的 Box 在 release 时回收；
@@ -65,6 +69,8 @@ pub(crate) fn sink_release(h: u64) {
     }
     if let Some(e) = registry().lock().unwrap_or_else(PoisonError::into_inner).remove(&h) {
         if let Some(d) = e.dtor {
+            // SAFETY: 条目刚在注册表锁内被唯一移除，ctx 所有权移交 dtor（如
+            // fs_drop 的 Box::from_raw）；宿主契约保证终态后才 release，无 worker 再用该 ctx。
             unsafe { d(e.vt.ctx) };
         }
     }

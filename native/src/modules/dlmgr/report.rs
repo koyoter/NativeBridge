@@ -66,7 +66,7 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
         delta += done.saturating_sub(prev_done);
         let changed = prev
             .get(&t.id)
-            .map_or(true, |p| p.0 != state || p.1 != done);
+            .is_none_or(|p| p.0 != state || p.1 != done);
         // 退役规则：终态任务（Done/Failed/Canceled）首次上报即退役——终态计数
         // 与字节量并入全历史累计器（Canceled 不计成败），本拍不再计入 live 求和
         // （其贡献已由累计器承接，避免同拍双重计数），拍末从 tasks/prev 移除。
@@ -91,6 +91,8 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
             if let Some((cb, user)) = task_cb {
                 let bps = (done.saturating_sub(prev_done) as f64 / dt) as u64;
                 let err = t.err.load(Ordering::Relaxed);
+                // SAFETY: cb 为宿主经 dlmgr_set_task_callback 注册的非空 fn 指针，
+                // user 由宿主 keep-alive 保证存活；回调在锁外触发，重入只读 FFI 只经 Mutex/原子。
                 unsafe { cb(user.0, t.id, state, done, t.size, bps, err) };
             }
         }
@@ -114,6 +116,8 @@ fn report_tick(sh: &Shared, prev: &mut HashMap<u64, (i32, u64)>, prev_t: Instant
         let bytes_done = sh.bytes_done_total.load(Ordering::Relaxed) + bytes_done;
         let bytes_total = sh.bytes_total_total.load(Ordering::Relaxed) + bytes_total;
         let gbps = (delta as f64 / dt) as u64;
+        // SAFETY: cb 为宿主经 dlmgr_set_global_callback 注册的非空 fn 指针，
+        // user 由宿主 keep-alive 保证存活；调用时未持任何锁，重入只读 FFI 只经 Mutex/原子。
         unsafe {
             cb(
                 user.0,

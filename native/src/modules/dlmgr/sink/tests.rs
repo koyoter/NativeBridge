@@ -6,6 +6,8 @@ fn file_sink_roundtrip_and_release() {
     path.push(format!("dlmgr_sink_test_{}.bin", std::process::id()));
     let h = FileSink::create(path.to_str().unwrap(), 8).expect("create sink");
     let vt = sink_lookup(h).expect("registered");
+    // SAFETY: vt/ctx 由 sink_lookup 从注册表取出的存活条目同源发放；
+    // sink 在本测试末尾才 release，调用串行发生在单测试线程上。
     unsafe {
         assert_eq!((vt.prepare)(vt.ctx, 8), 0);
         let data = b"abcdefgh";

@@ -40,7 +40,11 @@ pub(crate) type DlmgrGlobalCb = unsafe extern "C" fn(*mut c_void, u32, u32, u32,
 /// 跨线程持有的裸指针（回调 user / curl share 句柄）：仅存取，不解引用。
 #[derive(Clone, Copy)]
 pub(crate) struct SendPtr(pub(crate) *mut c_void);
+// SAFETY: Send：内部裸指针仅原值跨线程传递、本类型从不解引用；user 依赖宿主
+// keep-alive 契约存活，share 句柄由管理器保活至 shutdown 的 curlw_share_cleanup。
 unsafe impl Send for SendPtr {}
+// SAFETY: Sync：字段不可变且无内部可变性，并发共享只拷贝指针值；实际使用
+// （回调透传、share 传入 curl）都发生在宿主/管理器保证句柄存活的窗口内。
 unsafe impl Sync for SendPtr {}
 
 // Mark dlmgr-owned threads at their entry point, before callbacks can run. The Arc's
@@ -49,7 +53,7 @@ unsafe impl Sync for SendPtr {}
 // reporter callback shutting down a different manager could join a reporter that
 // is waiting on this one, and workers can re-enter through sink callbacks.
 thread_local! {
-    static INTERNAL_MANAGER: Cell<*const Shared> = Cell::new(ptr::null());
+    static INTERNAL_MANAGER: Cell<*const Shared> = const { Cell::new(ptr::null()) };
 }
 
 pub(crate) struct InternalThreadGuard {

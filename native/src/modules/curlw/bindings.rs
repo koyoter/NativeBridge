@@ -1,6 +1,6 @@
-// curl 绑定镜像：C 风格命名与未引用的常量/类型属正常形态，按文件豁免
-// （此前由 crate 级 allow 兜底，现收敛到此）。
-#![allow(dead_code, nonstandard_style)]
+// curl 绑定镜像：C 风格命名（含 CURL* 大写缩写，1:1 对齐 libcurl C ABI）与
+// 未引用的常量/类型属正常形态，按文件豁免（此前由 crate 级 allow 兜底，现收敛到此）。
+#![allow(dead_code, nonstandard_style, clippy::upper_case_acronyms)]
 
 use super::*;
 

@@ -38,9 +38,9 @@ jobs:
       NB_RUN_CARGO_TESTS: '1'
     steps:
       - uses: actions/checkout@v6
-      - name: Clippy (panic-free rules)
+      - name: Clippy (panic-free rules, zero warnings)
         shell: pwsh
-        run: cargo clippy --manifest-path native/Cargo.toml --all-targets
+        run: cargo clippy --manifest-path native/Cargo.toml --all-targets -- -D warnings
       - name: Cache dependency libraries
         uses: actions/cache@v4
         with:

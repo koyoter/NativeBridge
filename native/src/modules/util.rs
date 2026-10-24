@@ -61,7 +61,7 @@ pub(crate) fn pwrite(f: &File, off: u64, buf: &[u8]) -> std::io::Result<()> {
             if n == 0 {
                 return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite: seek_write wrote 0"));
             }
-            buf = &buf[n as usize..];
+            buf = &buf[n..];
             off += n as u64;
         }
         Ok(())

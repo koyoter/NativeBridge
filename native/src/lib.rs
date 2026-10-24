@@ -9,6 +9,11 @@ use libc::c_char;
 use std::ffi::CString;
 use std::sync::OnceLock;
 
+/// 返回静态版本串指针。规则 2 的**文档化例外**：crate 根版本导出不属于任何
+/// 模块，`unsafe` 仅因跨 ABI 返回裸指针。
+///
+/// # Safety
+/// 返回值指向进程生命周期的静态存储（OnceLock），调用方不得 free 或改写。
 #[no_mangle]
 // 例外位点（可证不失败）：版本串由 format! 与 C 字符串组件拼接，不可能含内部 NUL。
 #[allow(clippy::expect_used)]

@@ -7,10 +7,13 @@
    错误经 ?、ok_or(..)?、let .. else、unwrap_or* 传播（回退仅在真正确时用，不得静默损坏数据）；
    FFI 导出返回错误码/错误回调。唯一例外：可证不失败的位点用
    `#[allow(clippy::expect_used)]` + `.expect("为什么不会失败")` 标注。
-   强制手段：native/Cargo.toml `[lints.clippy]` deny + CI `cargo clippy --all-targets`
-   （lib 尚有约 21 条既有默认组警告，属第 2 条 SAFETY 注释补齐范围，补齐后升 -D warnings）。
+   强制手段：native/Cargo.toml `[lints.clippy]` deny + CI `cargo clippy --all-targets -- -D warnings`
+   （2026-10-24 起 -D warnings 生效：21 条存量默认组警告已清零）。
 2. unsafe 纪律（本库即 FFI，无法禁用）：unsafe 限定在 native/src/modules/ 下（curlw/dlmgr/vfs/glue）；
-   目标是每个 unsafe 块都有 SAFETY: 注释（随改随补）；全库补齐后升 `unsafe_op_in_unsafe_fn = deny`。
+   每个 unsafe 块必须有 SAFETY: 注释，`undocumented_unsafe_blocks = deny` 拦新增（2026-10-24 全库补齐）；
+   唯一例外：lib.rs 的 nativebridge_version（文档化例外，见其 # Safety 注记）。
+   未启用的终态目标 `unsafe_op_in_unsafe_fn = deny`：约 272 处 unsafe-fn 体内裸操作
+   （93% 在 curlw/mod.rs 镜像层），启用前需先决断镜像层是否按 bindings.rs 先例豁免。
 3. 递归必须带深度限制或 seen-set（当前代码库无递归；此条防新增路径/结构遍历裸奔）。
 4. Mutex/Condvar 一律 `.unwrap_or_else(PoisonError::into_inner)`（全库已采用）。
    `panic = "abort"` 下锁不会中毒，此写法是为 lint 合规与 profile 无关性；

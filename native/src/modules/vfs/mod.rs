@@ -117,7 +117,7 @@ pub(crate) fn pread(f: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
                     "vfs: seek_read read 0",
                 ));
             }
-            done += n as usize;
+            done += n;
             off += n as u64;
         }
         Ok(())
@@ -281,9 +281,11 @@ impl VfsShared {
 
     /// commit 回调在锁外触发（允许回调内重入 VFS 查询）。
     fn fire_commit(&self, name: &str, off: u64, size: u64, crc: u32) {
-        let cb = self.commit_cb.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let cb = *self.commit_cb.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((f, user)) = cb {
             let c = CString::new(name).unwrap_or_default();
+            // SAFETY: f/user 由宿主 keep-alive 保证在句柄存活期有效；name 指向本
+            // 调用内存活的 CString；回调在锁外触发，重入的 VFS 查询只经 Mutex/原子。
             unsafe { f(user as *mut c_void, c.as_ptr(), off, size, crc) };
         }
     }
@@ -359,12 +361,14 @@ impl Vfs {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // 开或建，绝不截断既有容器
             .open(data)
             .map_err(ioerr)?;
         let header_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // 同上
             .open(index)
             .map_err(ioerr)?;
 
@@ -1139,8 +1143,8 @@ pub unsafe extern "C" fn vfs_enumerate_read(
     match v.enumerate_read(gen, names, offs, sizes, crcs, &mut states) {
         Err(e) => e.as_i32() as c_int,
         Ok(()) => {
-            for i in 0..count {
-                *state.add(i) = states[i] as c_int;
+            for (i, s) in states[..count].iter().enumerate() {
+                *state.add(i) = *s as c_int;
             }
             VFS_OK as c_int
         }
