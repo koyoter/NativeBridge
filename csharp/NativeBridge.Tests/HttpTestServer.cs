@@ -3,11 +3,15 @@
 //
 // 能力：按路径伺服固定字节；支持 Range: bytes=N-（206 + Content-Range）；
 //       可配置"永远 200"（模拟不支持 Range 的源，触发 dual-URL 回退）；
-//       可配置慢速分块发送（供取消测试抢在完成前 cancel）。
+//       可配置慢速分块发送（供取消测试抢在完成前 cancel）；
+//       可配置前 N 次请求中途掐断（断连续传/退避测试）；
+//       记录每请求的 Range 头与命中时刻（Log()，供 T5 矩阵断言）。
 // ponytail: HttpListener 单线程顺序处理；并发多任务测试出现时再上 ThreadPool。
 //
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -24,6 +28,8 @@ namespace NativeBridgeF.Tests
             public int Chunk;           // 慢速模式的块大小
             public int DropRequests;    // 前 N 次请求传输中途掐断（瞬时故障），之后正常
             public int Seen;            // 已收到的请求计数（与 DropRequests 配合）
+            public readonly ConcurrentQueue<string> Ranges = new ConcurrentQueue<string>(); // 每请求 Range 头原文（无则 ""）
+            public readonly ConcurrentQueue<long> Hits = new ConcurrentQueue<long>();       // 请求命中时刻（Stopwatch 时间戳）
         }
 
         private readonly HttpListener _listener = new HttpListener();
@@ -60,6 +66,13 @@ namespace NativeBridgeF.Tests
                 Body = body, Force200 = force200, SlowMs = slowMs, Chunk = chunk, DropRequests = dropRequests
             };
             return BaseUrl + path.TrimStart('/');
+        }
+
+        /// <summary>取路径的请求记录：ranges = 每请求 Range 头原文（无则 ""）；hits = 命中时刻（Stopwatch 时间戳）。</summary>
+        public (ConcurrentQueue<string> ranges, ConcurrentQueue<long> hits) Log(string path)
+        {
+            Route r = _routes[path.TrimStart('/')];
+            return (r.Ranges, r.Hits);
         }
 
         private void Loop()
@@ -102,6 +115,8 @@ namespace NativeBridgeF.Tests
                 if (startStr.Length > 0) long.TryParse(startStr, out start);
                 if (start < 0 || start >= body.Length) start = 0;
             }
+            route.Ranges.Enqueue(range ?? "");
+            route.Hits.Enqueue(Stopwatch.GetTimestamp());
 
             // Range 请求且未配置 Force200 → 206 切片（start=0 也回 206：
             // worker 用 "Range: bytes=0-" 探测 range_url，200 会触发回退）。

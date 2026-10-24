@@ -3,7 +3,8 @@
 //
 // 真实走 curl → 127.0.0.1 HttpTestServer，覆盖：文件 sink 下载回环、
 // dual-URL 回退语义（range 源不支持 Range → 切 full 源）、crc 闸失败、
-// 运行中取消、以及 dlmgr + VFS sink 的端到端胶水（T6 场景）。
+// 运行中取消、断连续传与退避计时、限速三态、10Hz 节流与字节对账（T5 验收矩阵）、
+// 以及 dlmgr + VFS sink 的端到端胶水（T6 场景）。
 //
 // 已知 e2e 缺口：真 TLS + CA blob 握手链路无人覆盖——HttpTestServer 为纯 HTTP，
 // dlmgr_set_ca_blob 仅参数级验证；"喂 CA 后真 HTTPS 下载成功"需真 URL 或本地
@@ -12,6 +13,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -454,6 +456,443 @@ namespace NativeBridgeF.Tests
             }
             finally
             {
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        // --- T5 验收矩阵：断连续传 / 退避计时 / 限速 / 10Hz 节流 / 字节对账 --------------
+        // native 侧契约依据：worker.rs transition() 三道闸（非 206 / Content-Range 总长 /
+        // crc）+ net_retry 退避 1s/2s/4s（第 3 次起封顶 4s）+ rate.rs 双令牌桶
+        // （rate 实为字节/秒，桶初始满 = 1 秒等量突发）+ report.rs 10Hz 节流
+        // （同一轮先逐任务后全局）。时间断言一律 ±40% 宽容差，防 CI 慢机误报。
+
+        /// <summary>
+        /// 测试重点：断连续传（T5）——首请求 Range: bytes=0- 传输中途被掐断，
+        /// 重试必须带非零断点 Range: bytes=off- 续传；期间进度单调不回头、不超
+        /// 总长、终值精确（断连续传不重复计数）；最终文件逐字节拼回完整数据。
+        /// </summary>
+        [Test]
+        public void MidTransferDrop_ResumesWithRange_NoDoubleCount()
+        {
+            byte[] data = TestPaths.Content(1024 * 1024, 71);
+            string url = _server.Add("resume.bin", data, dropRequests: 1);
+            var (ranges, _) = _server.Log("resume.bin");
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            // 本地 manager + 记历史的回调（fixture 的 Record 只存最新值，对账需要全序列）
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 0, 2);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            var samples = new ConcurrentQueue<(int state, ulong done)>();
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr,
+                (user, id, state, done, total, bps, err) =>
+                {
+                    samples.Enqueue((state, done));
+                    OnTask(user, id, state, done, total, bps, err);
+                }, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, outPath, (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                ulong id = EnqueueLocal(mgr, url, "resume.bin", data, sink);
+                Record r = WaitTerminal(id, TerminalMs);
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "续传后应 Done, err=" + r.Err);
+                Assert.That(r.Done, Is.EqualTo((ulong)data.Length));
+
+                // 服务器视角：恰好两个请求，首探测 bytes=0-，重试带非零断点
+                var seen = new List<string>(ranges);
+                Assert.That(seen.Count, Is.EqualTo(2), "掐断一次后应恰好两个请求");
+                Assert.That(seen[0], Is.EqualTo("bytes=0-"), "首请求应探测 bytes=0-");
+                Assert.That(seen[1], Does.StartWith("bytes="), "重试应带 Range 头续传");
+                Assert.That(seen[1], Is.Not.EqualTo("bytes=0-"), "断点必须非零（不得从头重下）");
+
+                // 字节对账：进度单调不回头、不超总长、终值精确 == size
+                ulong prev = 0;
+                foreach (var s in samples)
+                {
+                    Assert.That(s.done, Is.GreaterThanOrEqualTo(prev), "进度不得回退（重复计数）");
+                    Assert.That(s.done, Is.LessThanOrEqualTo((ulong)data.Length), "进度不得超总长");
+                    prev = s.done;
+                }
+                Assert.That(prev, Is.EqualTo((ulong)data.Length), "终值必须精确等于 size");
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data), "续传拼回的数据必须完整");
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr); // 先 join 再释放 sink（消费句柄）
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：重试退避（T5）——range 源回 200 触发不耗预算的兜底切 full_url；
+        /// full_url 连续掐断 4 次（初始 + 3 重试）耗尽预算 → Failed(Network)。
+        /// 服务器命中时刻实测退避间隔 ≈ 1s/2s/4s（±40% 宽容差）。
+        /// </summary>
+        [Test]
+        public void FullUrlFailures_Backoff1s2s4s_ThenFailed()
+        {
+            byte[] full = TestPaths.Content(16 * 1024, 72);
+            string rangeUrl = _server.Add("bk-range.bin", new byte[16], force200: true);
+            string fullUrl = _server.Add("bk-full.bin", full, dropRequests: 4);
+            var (_, hits) = _server.Log("bk-full.bin");
+            string outDir = TestPaths.NewDir();
+
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 0, 3); // 重试预算 3 → 4 次尝试 3 段退避
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, Path.Combine(outDir, "out.bin"),
+                                                         (ulong)full.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                int rc = DlmgrDLL.dlmgr_enqueue(mgr, rangeUrl, fullUrl, "bk.bin",
+                                                (ulong)full.Length, TestPaths.Crc32(full),
+                                                0, 0, sink, out ulong id);
+                Assert.That(rc, Is.EqualTo(0), "enqueue 失败");
+                Record r = WaitTerminal(id, TerminalMs);
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Failed), "耗尽预算应 Failed");
+                Assert.That(r.Err, Is.EqualTo((int)DlmgrTaskError.Network), "错误码应为 Network");
+
+                var ts = new List<long>(hits);
+                Assert.That(ts.Count, Is.EqualTo(4), "初始 + 3 次重试应恰好 4 个请求");
+                double[] expect = { 1.0, 2.0, 4.0 };
+                for (int i = 1; i < ts.Count; i++)
+                {
+                    double gap = (ts[i] - ts[i - 1]) / (double)Stopwatch.Frequency;
+                    Assert.That(gap, Is.InRange(expect[i - 1] * 0.6, expect[i - 1] * 1.4),
+                                "第 " + i + " 段退避间隔实测 " + gap.ToString("F2") + "s");
+                }
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：crc 闸兜底（T5）——range 源长度正确但内容不符（流式 crc ≠
+        /// 预期），源不可信一次性切 full_url；full 源正确 → Done，文件必须来自
+        /// full 源（两源内容不同以区分下载自谁）。
+        /// </summary>
+        [Test]
+        public void RangeCrcWrong_FallsBackToFullUrl_Succeeds()
+        {
+            byte[] wrong = TestPaths.Content(128 * 1024, 3);
+            byte[] right = TestPaths.Content(128 * 1024, 4);
+            string rangeUrl = _server.Add("crc-range.bin", wrong);
+            string fullUrl = _server.Add("crc-full.bin", right);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(_mgr, outPath, (ulong)right.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            Record r;
+            try
+            {
+                ulong id = Enqueue(rangeUrl, fullUrl, "crc-fb.bin", (ulong)right.Length,
+                                   TestPaths.Crc32(right), sink);
+                r = WaitTerminal(id, TerminalMs);
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            try
+            {
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "兜底后应 Done, err=" + r.Err);
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(right), "文件必须来自 full 源");
+            }
+            finally
+            {
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：Content-Range 总长闸兜底（T5）——range 源总长 ≠ 任务声明
+        /// size（越界风险）→ 一次性切 full_url；full 源长度正确 → Done，
+        /// 文件必须来自 full 源。
+        /// </summary>
+        [Test]
+        public void RangeSizeMismatch_FallsBackToFullUrl_Succeeds()
+        {
+            byte[] shortBody = TestPaths.Content(64 * 1024, 5);  // range 源：只有声明的一半
+            byte[] right = TestPaths.Content(128 * 1024, 6);     // full 源：与声明一致
+            string rangeUrl = _server.Add("sz-range.bin", shortBody);
+            string fullUrl = _server.Add("sz-full.bin", right);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(_mgr, outPath, (ulong)right.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            Record r;
+            try
+            {
+                ulong id = Enqueue(rangeUrl, fullUrl, "sz-fb.bin", (ulong)right.Length,
+                                   TestPaths.Crc32(right), sink);
+                r = WaitTerminal(id, TerminalMs);
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            try
+            {
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "兜底后应 Done, err=" + r.Err);
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(right), "文件必须来自 full 源");
+            }
+            finally
+            {
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：总长闸耗尽（T5）——range 源总长不符触发兜底后，full 源总长
+        /// 也不符：full 阶段任何失败耗 retry，耗尽后 Failed 且错误码为
+        /// SizeMismatch(2)。
+        /// </summary>
+        [Test]
+        public void SizeMismatchBothSources_TaskFails()
+        {
+            byte[] shortRange = TestPaths.Content(64 * 1024, 7);
+            byte[] shortFull = TestPaths.Content(64 * 1024, 8);
+            byte[] expected = TestPaths.Content(128 * 1024, 9); // 任务声明的期望内容
+            string rangeUrl = _server.Add("szf-range.bin", shortRange);
+            string fullUrl = _server.Add("szf-full.bin", shortFull);
+            string outDir = TestPaths.NewDir();
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(_mgr, Path.Combine(outDir, "out.bin"),
+                                                         (ulong)expected.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                ulong id = Enqueue(rangeUrl, fullUrl, "sz-fail.bin", (ulong)expected.Length,
+                                   TestPaths.Crc32(expected), sink);
+                Record r = WaitTerminal(id, TerminalMs);
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Failed), "应为 Failed");
+                Assert.That(r.Err, Is.EqualTo((int)DlmgrTaskError.SizeMismatch),
+                            "错误码应为 SizeMismatch");
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：全局限速（T5）——全局 1MB/s 单任务不限：6MB 实测 ≈5s
+        /// （令牌桶初始满 = 1 秒等量突发，扣除后 (6-1)MB / 1MBps）。带宽
+        /// [3s, 7s]：上限防 CI 慢机误报，下限证明限速真实生效（不限速时
+        /// 本机回环远小于 1s）。
+        /// </summary>
+        [Test]
+        public void RateLimit_GlobalBytesPerSecond()
+        {
+            byte[] data = TestPaths.Content(6 * 1024 * 1024, 11);
+            string url = _server.Add("rate-g.bin", data);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 1024 * 1024, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, outPath, (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                ulong id = EnqueueLocal(mgr, url, "rate-g.bin", data, sink);
+                Record r = WaitTerminal(id, TerminalMs);
+                sw.Stop();
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "限速下载应 Done, err=" + r.Err);
+                double sec = sw.Elapsed.TotalSeconds;
+                Assert.That(sec, Is.InRange(3.0, 7.0),
+                            "6MB @1MB/s 应 ≈5s（含 1MB 突发），实测 " + sec.ToString("F2") + "s");
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：单任务限速取 min（T5）——全局 1MB/s + 单任务 512KB/s →
+        /// 实测 ≈512KB/s：4MB ≈7s（扣 512KB 突发后 (4-0.5)MB / 0.5MBps）。
+        /// 带宽 [4.2s, 9.8s] 下限同时证明单任务桶压过全局桶（仅全局时 ≈3s）。
+        /// </summary>
+        [Test]
+        public void RateLimit_TaskLimitTakesMinWithGlobal()
+        {
+            byte[] data = TestPaths.Content(4 * 1024 * 1024, 12);
+            string url = _server.Add("rate-t.bin", data);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 1024 * 1024, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, outPath, (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                int rc = DlmgrDLL.dlmgr_enqueue(mgr, url, null, "rate-t.bin", (ulong)data.Length,
+                                                TestPaths.Crc32(data), 0, 512UL * 1024, sink,
+                                                out ulong id);
+                Assert.That(rc, Is.EqualTo(0), "enqueue 失败");
+                Record r = WaitTerminal(id, TerminalMs);
+                sw.Stop();
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "限速下载应 Done, err=" + r.Err);
+                double sec = sw.Elapsed.TotalSeconds;
+                Assert.That(sec, Is.InRange(4.2, 9.8),
+                            "4MB @512KB/s 应 ≈7s（含 512KB 突发），实测 " + sec.ToString("F2") + "s");
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：动态解除限速（T5）——全局 512KB/s 下 6MB 任务跑到中途，
+        /// set_global_speed(0) 立即生效恢复全速：总耗时远小于全程限速的
+        /// ≈11s（带宽 <5s），且文件完整正确。
+        /// </summary>
+        [Test]
+        public void RateLimit_SetGlobalZero_ResumesFullSpeed()
+        {
+            byte[] data = TestPaths.Content(6 * 1024 * 1024, 13);
+            string url = _server.Add("rate-0.bin", data);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 512UL * 1024, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr, OnTask, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, outPath, (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                ulong id = EnqueueLocal(mgr, url, "rate-0.bin", data, sink);
+                WaitState(id, (int)DlmgrTaskState.Running, 15_000);
+                Thread.Sleep(1500); // 限速下载确实进行中（≈512KB 突发 + 0.5s 配额）
+                Assert.That(DlmgrDLL.dlmgr_set_global_speed(mgr, 0), Is.EqualTo(0));
+                Record r = WaitTerminal(id, TerminalMs);
+                sw.Stop();
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "解除限速后应 Done, err=" + r.Err);
+                double sec = sw.Elapsed.TotalSeconds;
+                Assert.That(sec, Is.InRange(1.5, 5.0),
+                            "中途解除限速应 <5s（全程限速 ≈11s），实测 " + sec.ToString("F2") + "s");
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
+                DlmgrDLL.dlmgr_sink_release(sink);
+                try { Directory.Delete(outDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 测试重点：上报节流与顺序（T5）——10Hz 节流下任务回调频率 ≤ ~11 次/秒
+        /// （慢速 2MB ≈3.2s，应 ≥5 次进度上报证明上报在工作）；同一轮先任务后
+        /// 全局：全局回调首次报 done=1 之前，该任务的 Done 终态回调必已发生。
+        /// cancel 终态语义已由 Cancel_RunningTask 覆盖，不在此重复。
+        /// </summary>
+        [Test]
+        public void CallbackThrottle_10Hz_TaskBeforeGlobal()
+        {
+            byte[] data = TestPaths.Content(2 * 1024 * 1024, 14);
+            string url = _server.Add("throttle.bin", data, slowMs: 25, chunk: 16 * 1024);
+            string outDir = TestPaths.NewDir();
+            string outPath = Path.Combine(outDir, "out.bin");
+
+            IntPtr mgr = DlmgrDLL.dlmgr_create(1, 0, 0);
+            Assert.That(mgr, Is.Not.EqualTo(IntPtr.Zero));
+            var evLock = new object();
+            int seq = 0, taskDoneSeq = -1, globalFirstDoneSeq = -1;
+            long firstTick = 0, lastTick = 0;
+            int runningCount = 0;
+            Assert.That(DlmgrDLL.dlmgr_set_task_callback(mgr,
+                (user, id, state, done, total, bps, err) =>
+                {
+                    lock (evLock)
+                    {
+                        seq++;
+                        if (state == (int)DlmgrTaskState.Running)
+                        {
+                            runningCount++;
+                            long t = Stopwatch.GetTimestamp();
+                            if (firstTick == 0) firstTick = t;
+                            lastTick = t;
+                        }
+                        if (state == (int)DlmgrTaskState.Done) taskDoneSeq = seq;
+                    }
+                    OnTask(user, id, state, done, total, bps, err);
+                }, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_set_global_callback(mgr,
+                (user, active, doneCount, failedCount, bytesDone, bytesTotal, bps) =>
+                {
+                    lock (evLock)
+                    {
+                        seq++;
+                        if (doneCount >= 1 && globalFirstDoneSeq < 0) globalFirstDoneSeq = seq;
+                    }
+                }, IntPtr.Zero), Is.EqualTo(0));
+            Assert.That(DlmgrDLL.dlmgr_start(mgr), Is.EqualTo(0));
+
+            ulong sink = DlmgrDLL.dlmgr_sink_create_file(mgr, outPath, (ulong)data.Length);
+            Assert.That(sink, Is.Not.EqualTo(0UL));
+            try
+            {
+                ulong id = EnqueueLocal(mgr, url, "throttle.bin", data, sink);
+                Record r = WaitTerminal(id, TerminalMs);
+                Assert.That(r.State, Is.EqualTo((int)DlmgrTaskState.Done), "应为 Done, err=" + r.Err);
+
+                // 等全局回调上报 done=1（终态 tick 与全局 tick 之间有 ≤100ms 滞后）
+                var deadline = DateTime.UtcNow.AddSeconds(5);
+                while (Volatile.Read(ref globalFirstDoneSeq) < 0 && DateTime.UtcNow < deadline)
+                {
+                    Thread.Sleep(50);
+                }
+
+                Assert.That(runningCount, Is.GreaterThanOrEqualTo(5), "进度上报应在工作");
+                double window = (lastTick - firstTick) / (double)Stopwatch.Frequency;
+                Assert.That(window, Is.GreaterThan(0.5), "慢速下载窗口应足够长");
+                Assert.That(runningCount, Is.AtMost((int)(11 * window) + 3),
+                            "10Hz 节流下进度回调 " + runningCount + " 次 / " + window.ToString("F1") +
+                            "s，超 ~11 次/秒");
+
+                Assert.That(Volatile.Read(ref globalFirstDoneSeq), Is.GreaterThan(0),
+                            "全局回调应上报 done=1");
+                Assert.That(taskDoneSeq, Is.GreaterThan(0), "任务 Done 终态回调应已发生");
+                Assert.That(taskDoneSeq, Is.LessThan(globalFirstDoneSeq),
+                            "同一轮必须先任务后全局");
+            }
+            finally
+            {
+                DlmgrDLL.dlmgr_shutdown(mgr);
                 DlmgrDLL.dlmgr_sink_release(sink);
                 try { Directory.Delete(outDir, true); } catch { }
             }
