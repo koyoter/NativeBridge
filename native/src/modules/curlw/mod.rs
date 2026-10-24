@@ -62,8 +62,8 @@ fn clamp_native_long(unsigned_ok: bool, value: i64) -> Option<c_long> {
     if mem::size_of::<c_long>() == mem::size_of::<i64>() {
         return Some(value as c_long);
     }
-    let min = c_long::MIN as i64;
-    let max = c_long::MAX as i64;
+    let min = i64::from(c_long::MIN);
+    let max = i64::from(c_long::MAX);
     if value < min {
         return None;
     }

@@ -1,0 +1,4 @@
+# 钉住 CI/本地一致的 Rust 工具链：CI runner 的预装 stable 会漂移（1.97 → 1.99
+# 曾让新 lint 在 tag 验证时才爆），rustup 对本文件钉的版本会自动安装。
+[toolchain]
+channel = "1.99.0"

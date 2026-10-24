@@ -237,7 +237,7 @@ pub(crate) fn scan_slot(bytes: &[u8], off: usize) -> Option<SlotScan> {
         if crc32(&bytes[body_off..end]) == region_crc {
             let mut entries = Vec::with_capacity(count);
             let mut ok = true;
-            for cell in table.chunks_exact(ENTRY_SIZE) {
+            for cell in table.as_chunks::<ENTRY_SIZE>().0 {
                 match Entry::decode(cell) {
                     Some(e) => {
                         let s = e.name_off as usize;
