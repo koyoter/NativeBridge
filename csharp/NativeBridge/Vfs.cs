@@ -117,11 +117,7 @@ namespace NativeBridgeF
     /// </summary>
     public static class VfsDLL
     {
-#if (UNITY_IOS || UNITY_TVOS) && !UNITY_EDITOR
-        public const string LIBNAME = "__Internal";
-#else
-        public const string LIBNAME = "NativeBridge";
-#endif
+        public const string LIBNAME = DlmgrDLL.LIBNAME;
 
         // --- version / ABI ------------------------------------------------------
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl)]
@@ -241,7 +237,7 @@ namespace NativeBridgeF
         private IntPtr _h;
         private readonly string _indexPath;
         private readonly string _dataPath;
-        private readonly Dictionary<string, VfsEntry> _index = new Dictionary<string, VfsEntry>();
+        private Dictionary<string, VfsEntry> _index = new Dictionary<string, VfsEntry>();
         private ulong _refreshedGen;
 
         // files.vfs mapping (rebuilt whenever the physical size changes)
@@ -330,7 +326,7 @@ namespace NativeBridgeF
             const int MaxAttempts = 8;
             for (int attempt = 0; ; attempt++)
             {
-                ulong gen, dummy1;
+                ulong gen;
                 uint count, blobLen;
                 int err = VfsDLL.vfs_enumerate_query(_h, out gen, out count, out blobLen);
                 ThrowOnError(err, "vfs_enumerate_query");
@@ -365,8 +361,7 @@ namespace NativeBridgeF
                         Crc = crcs[i],
                     };
                 }
-                _index.Clear();
-                foreach (var kv in idx) _index.Add(kv.Key, kv.Value);
+                _index = idx;
                 _refreshedGen = gen;
                 break;
             }

@@ -343,11 +343,7 @@ namespace NativeBridgeF
     /// </summary>
     public static class DlVfs
     {
-#if (UNITY_IOS || UNITY_TVOS) && !UNITY_EDITOR
-        public const string LIBNAME = "__Internal";
-#else
-        public const string LIBNAME = "NativeBridge";
-#endif
+        public const string LIBNAME = DlmgrDLL.LIBNAME;
 
         // Creates a sink that downloads `name` into the VFS `vfs` (handle from
         // VfsDLL.vfs_open). `size` is ignored (ABI placeholder); the task's size

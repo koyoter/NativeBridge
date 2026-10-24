@@ -58,7 +58,7 @@ fn multi_allows_unsigned_long(opt: CURLMoption) -> bool {
     opt == CURLMOPT_MAXCONNECTS
 }
 
-fn try_native_long(opt: CURLoption, value: i64) -> Option<c_long> {
+fn clamp_native_long(unsigned_ok: bool, value: i64) -> Option<c_long> {
     if mem::size_of::<c_long>() == mem::size_of::<i64>() {
         return Some(value as c_long);
     }
@@ -68,28 +68,7 @@ fn try_native_long(opt: CURLoption, value: i64) -> Option<c_long> {
         return None;
     }
     if value > max {
-        if !allows_unsigned_long(opt) {
-            return None;
-        }
-        let umax = c_long::MAX as u64;
-        if (value as u64) > (umax * 2 + 1) {
-            return None;
-        }
-    }
-    Some(value as c_long)
-}
-
-fn multi_try_native_long(opt: CURLMoption, value: i64) -> Option<c_long> {
-    if mem::size_of::<c_long>() == mem::size_of::<i64>() {
-        return Some(value as c_long);
-    }
-    let min = c_long::MIN as i64;
-    let max = c_long::MAX as i64;
-    if value < min {
-        return None;
-    }
-    if value > max {
-        if !multi_allows_unsigned_long(opt) {
+        if !unsigned_ok {
             return None;
         }
         let umax = c_long::MAX as u64;
@@ -137,14 +116,7 @@ pub unsafe extern "C" fn curlw_version_imp() -> *const c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn curlw_create_socket(af: c_int, socktype: c_int, protocol: c_int) -> intptr_t {
-    #[cfg(windows)]
-    {
-        socket(af, socktype, protocol) as intptr_t
-    }
-    #[cfg(not(windows))]
-    {
-        socket(af, socktype, protocol) as intptr_t
-    }
+    socket(af, socktype, protocol) as intptr_t
 }
 
 #[no_mangle]
@@ -366,7 +338,7 @@ pub unsafe extern "C" fn curlw_easy_setopt_long(
     if !is_long_option(option) {
         return CURLE_BAD_FUNCTION_ARGUMENT;
     }
-    let Some(native) = try_native_long(option, optval) else {
+    let Some(native) = clamp_native_long(allows_unsigned_long(option), optval) else {
         return CURLE_BAD_FUNCTION_ARGUMENT;
     };
     curl_easy_setopt_long(handle, option, native)
@@ -700,7 +672,7 @@ pub unsafe extern "C" fn curlw_multi_setopt_long(
     if !is_long_option(option as CURLoption) {
         return CURLM_BAD_FUNCTION_ARGUMENT;
     }
-    let Some(native) = multi_try_native_long(option, optval) else {
+    let Some(native) = clamp_native_long(multi_allows_unsigned_long(option), optval) else {
         return CURLM_BAD_FUNCTION_ARGUMENT;
     };
     curl_multi_setopt_long(multi_handle, option, native)

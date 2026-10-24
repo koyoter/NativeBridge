@@ -145,26 +145,9 @@ impl Shared {
     /// 从队列摘除 id（若在排队）；返回是否摘到。锁序：queue 单锁，无嵌套。
     fn remove_queued(&self, id: u64) -> bool {
         let mut q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if q.heap.is_empty() {
-            return false;
-        }
-        let mut removed = false;
-        let kept: Vec<HeapTask> = q
-            .heap
-            .drain()
-            .filter(|ht| {
-                if ht.task.id == id {
-                    removed = true;
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        for ht in kept {
-            q.heap.push(ht);
-        }
-        removed
+        let before = q.heap.len();
+        q.heap.retain(|ht| ht.task.id != id);
+        before != q.heap.len()
     }
 
     /// 改排队中任务的下载权重（priority 大者先派发）：drain 重排即可，队列短，
