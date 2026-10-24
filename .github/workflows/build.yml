@@ -542,7 +542,8 @@ jobs:
       - name: Assert package contents (T6)
         shell: bash
         run: |
-          list="$(unzip -l "$NB_DIST_ZIP" | awk '{print $4}')"
+          # zip -r 打包目录本身：剥掉首段包名前缀（NativeBridge-<ver>/）再比对
+          list="$(unzip -l "$NB_DIST_ZIP" | awk '{print $4}' | sed 's|^[^/]*/||')"
           missing=0
           check() {
             echo "$list" | grep -qx "$1" || { echo "::error::zip missing $1"; missing=1; }
