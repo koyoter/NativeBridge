@@ -55,6 +55,8 @@ SuperBlock:
 
 Region:
   region头(32B): gen u64 | entry_count u32 | string_area_len u32 | region_crc u32
+                 | logical_size u64 | slot_cap u32
+                 （slot_cap=0 = 旧格式槽，只能按 framing 自算长度走槽；非零 = 槽容量）
   EntryTable: Entry × entry_count
   StringArea: UTF-8 文件名（含后缀）连续存放，NUL 结尾便于 C# 侧切分
 
@@ -66,6 +68,8 @@ state: Active=0, Deleted=1, Downloading=2, Bad=3
 ```
 
 - 翻转时按需写更大的 region（header.vfs 尾部追加），容量无硬上限；2 万文件约 3MB。
+  （修订 2026-10：persist 支持**空闲槽容量复用**——新内容可落进 ≥ 自身长度的已释放
+  槽，槽容量记在 region 头 `slot_cap` 字段，header.vfs 不再严格单调增长。）
 - `files.vfs` = 纯数据区，文件按 **4K 对齐**连续摆放，无内联头。`data_logical_size`（SuperBlock/region 内）决定逻辑大小；物理大小 ≥ 逻辑（预扩容富余）。
 
 ### 2.2 打开与读写协议
@@ -73,7 +77,8 @@ state: Active=0, Deleted=1, Downloading=2, Bad=3
 - **open**：读 SuperBlock（sb_crc 坏则扫描双 region 取 gen 最高且校验通过者）→ 载入 active region → 建内存索引（`Vec<Entry>` + 名字 blob + `HashMap<String, idx>`）。`Downloading` 残留条目丢弃（数据成垃圾）；逻辑大小之外的多余物理数据（崩溃残留）可安全忽略/截断。
 - **写入三段式**：
   1. `alloc(name, size)`：校验（无整理、无同名 Active/Downloading）→ 登记 Downloading 条目、在逻辑末尾预留 4K 对齐区间、物理不足则 `set_len` 扩容 → 返回 writer 句柄。
-  2. `writer_write(rel_off, buf)`：用 writer **自己的 OS 句柄** pwrite 到 `entry.offset + rel_off`（Windows std 同句柄并发写不安全 → 每写入者独立句柄），越界即错；边写边累计 crc32（约束：顺序写满 `[0,size)`）。
+  2. `writer_write(rel_off, buf)`：用 writer **自己的 OS 句柄** pwrite 到 `entry.offset + rel_off`（Windows std 同句柄并发写不安全 → 每写入者独立句柄），越界即错；边写边累计 crc32（约束修订 2026-10：`[0,size)` 内顺序写走增量 crc；**回退重写允许**（dlmgr 换源
+  reset 后从零重下）——回写标脏，commit 时经自身句柄整读重算 crc；向前跳跃/越界仍即错）。
   3. `writer_commit()`：校验写满 → 条目置 Active、crc 入索引 → generation++ → 触发 commit 回调。`writer_abort()`：条目丢弃，区间成垃圾。
   - **commit 后数据永不移动**（整理期整体锁死），C# 已读数据不可能被破坏。
 - **C# 可见性**：commit 即刻可见（内存索引应答 FFI）；C# 经 `MemoryMappedFile` 读 files.vfs，本地页缓存与 pwrite 天然一致，无需 flush 即可读。**唯一防撕裂闸门 = 只读 Active 条目**。
@@ -135,6 +140,12 @@ dlmgr_set_global_speed(mgr, bps)     // 动态生效
 dlmgr_set_task_callback(mgr, cb, user) / dlmgr_set_global_callback(mgr, cb, user)
 dlmgr_active_count(mgr) / dlmgr_shutdown(mgr)
 dlmgr_sink_create_file(mgr, path, size) → sink   // FileSink（每任务独立句柄）
+// --- 以下为 2026-09 spec 之外的纯新增导出（2026-10 补记，行为见 C# 侧注释） ---
+dlmgr_set_ca_blob(mgr, pem_bytes)     // CURLOPT_CAINFO_BLOB：BoringSSL 无内置 CA，HTTPS 必需
+dlmgr_set_http_version(mgr, ver)      // CURLOPT_HTTP_VERSION 透传，Start 前快照
+dlmgr_set_priority(mgr, id, prio)     // 排队中任务动态提权；运行中/未知 id 返回 -1
+dlmgr_shutdown_try(mgr) → i32         // 非抛出版 shutdown：任何 dlmgr 内部线程（含回调）安全调用，
+                                       // 被拒返回 -1 不消费句柄；成功同 dlmgr_shutdown
 ```
 
 任务字段：双 URL + size（必填）+ crc32（必填）+ priority（大者先取、同级 FIFO、不抢占）+ 单任务 bps。**双令牌桶**（全局/单任务），实际速率 = min，0 = 不限。
@@ -152,6 +163,8 @@ Pending → Running:
 → Verifying（crc 流式已算完，直接判定）→ sink.finish()（VfsSink 即 commit）→ Done
 用尽 retry / 主动取消 → Failed / Canceled
 错误码：UNSUPPORTED_RANGE / SIZE_MISMATCH / CRC_MISMATCH / NETWORK / TIMEOUT / CANCELED
+（另有 BUSY——纯新增，2026-10 补记：sink prepare 撞上 VFS 整理窗口时先按 1s/2s/4s
+退避重试，仍整理中 → Failed(BUSY)，不再冤报 NETWORK）
 ```
 
 sink vtable（C ABI 函数指针，glue 以此桥接 vfs）：

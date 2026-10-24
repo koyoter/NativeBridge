@@ -474,7 +474,10 @@ namespace NativeBridgeF
             {
                 return false;
             }
-            if (_view == null || e.Offset + e.Size > (ulong)_view.Capacity || e.Size > int.MaxValue)
+            // Overflow-safe bounds check: e.Offset + e.Size could wrap ulong, so
+            // test each against the capacity independently (never throws).
+            if (_view == null || e.Offset > (ulong)_view.Capacity ||
+                e.Size > (ulong)_view.Capacity - e.Offset || e.Size > int.MaxValue)
             {
                 return false;
             }

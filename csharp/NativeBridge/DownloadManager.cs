@@ -108,6 +108,56 @@ namespace NativeBridgeF
                                              ulong bps);
 
     /// <summary>
+    /// Per-native-handle strong references to callback delegates: the native side
+    /// stores raw function pointers, so a registered managed delegate must outlive
+    /// its registration (GC of the thunk crashes the next native callback). One
+    /// instance per binding class (CurlwDLL / DlmgrDLL) — state must not mix
+    /// across libraries. Null delegates are a no-op (clear-registration call).
+    /// </summary>
+    internal sealed class DelegateRoots
+    {
+        private readonly System.Collections.Generic.Dictionary<IntPtr, System.Collections.Generic.List<Delegate>>
+            _byHandle = new System.Collections.Generic.Dictionary<IntPtr, System.Collections.Generic.List<Delegate>>();
+        private readonly object _lock = new object();
+
+        public void Add(IntPtr handle, Delegate cb)
+        {
+            if (cb == null) return;
+            lock (_lock)
+            {
+                System.Collections.Generic.List<Delegate> list;
+                if (!_byHandle.TryGetValue(handle, out list))
+                {
+                    _byHandle[handle] = list = new System.Collections.Generic.List<Delegate>();
+                }
+                list.Add(cb);
+            }
+        }
+
+        /// <summary>Drops a handle's roots (easy cleanup/reset, manager shutdown).</summary>
+        public void Remove(IntPtr handle)
+        {
+            lock (_lock) { _byHandle.Remove(handle); }
+        }
+
+        /// <summary>Handle's live roots (null if none) — snapshot for a later Install.</summary>
+        public System.Collections.Generic.List<Delegate> Snapshot(IntPtr handle)
+        {
+            lock (_lock)
+            {
+                return _byHandle.TryGetValue(handle, out System.Collections.Generic.List<Delegate> list) ? list : null;
+            }
+        }
+
+        /// <summary>Installs a copy of a snapshot under a new handle (easy_duphandle).</summary>
+        public void Install(IntPtr handle, System.Collections.Generic.List<Delegate> roots)
+        {
+            if (roots == null || handle == IntPtr.Zero) return;
+            lock (_lock) { _byHandle[handle] = new System.Collections.Generic.List<Delegate>(roots); }
+        }
+    }
+
+    /// <summary>
     /// Thin 1:1 binding of the native dlmgr C ABI (see modules/dlmgr/mod.rs).
     /// </summary>
     public static class DlmgrDLL
@@ -196,11 +246,9 @@ namespace NativeBridgeF
             if (result == 0)
             {
                 // Native joins have completed: no callback can still be in flight.
-                // Never hold s_cbLock across the native call (callbacks may re-enter).
-                lock (s_cbLock)
-                {
-                    s_handleCallbacks.Remove(mgr);
-                }
+                // Roots drop only AFTER the native call: never hold the roots lock
+                // across it (callbacks may re-enter).
+                s_roots.Remove(mgr);
             }
             return result;
         }
@@ -267,8 +315,8 @@ namespace NativeBridgeF
         // --- callbacks (keep-alive wrappers) -------------------------------------
         // The native side stores raw function pointers, so the managed delegate
         // MUST survive as long as it is registered. References are kept per
-        // manager handle (same discipline as Curlw.cs s_handleCallbacks): a
-        // process-wide single slot would drop a live delegate when a second
+        // manager handle via DelegateRoots (same discipline as Curlw.cs s_roots):
+        // a process-wide single slot would drop a live delegate when a second
         // manager registers or a callback is re-registered, and the GC'd thunk
         // would crash the next native callback.
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dlmgr_set_task_callback")]
@@ -277,39 +325,21 @@ namespace NativeBridgeF
         [DllImport(LIBNAME, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dlmgr_set_global_callback")]
         private static extern int dlmgr_set_global_callback_imp(IntPtr mgr, DlmgrGlobalCallback cb, IntPtr user);
 
-        private static readonly System.Collections.Generic.Dictionary<IntPtr, System.Collections.Generic.List<Delegate>>
-            s_handleCallbacks = new System.Collections.Generic.Dictionary<IntPtr, System.Collections.Generic.List<Delegate>>();
-        private static readonly object s_cbLock = new object();
+        private static readonly DelegateRoots s_roots = new DelegateRoots();
 
         // cb == null clears the registration natively. The handle's PREVIOUS
         // delegates are deliberately kept alive: a callback may still be in
         // flight on the reporter thread when the slot is cleared (bounded by
         // manager count, freed on shutdown).
-        private static void KeepAlive(IntPtr handle, Delegate cb)
-        {
-            if (cb == null) return;
-            lock (s_cbLock)
-            {
-                System.Collections.Generic.List<Delegate> list;
-                if (!s_handleCallbacks.TryGetValue(handle, out list))
-                {
-                    list = new System.Collections.Generic.List<Delegate>();
-                    s_handleCallbacks[handle] = list;
-                }
-                list.Add(cb);
-            }
-        }
-
-        // cb == null clears the registration (keep-alive references stay, see above).
         public static int dlmgr_set_task_callback(IntPtr mgr, DlmgrTaskCallback cb, IntPtr user)
         {
-            KeepAlive(mgr, cb);
+            s_roots.Add(mgr, cb);
             return dlmgr_set_task_callback_imp(mgr, cb, user);
         }
 
         public static int dlmgr_set_global_callback(IntPtr mgr, DlmgrGlobalCallback cb, IntPtr user)
         {
-            KeepAlive(mgr, cb);
+            s_roots.Add(mgr, cb);
             return dlmgr_set_global_callback_imp(mgr, cb, user);
         }
 
