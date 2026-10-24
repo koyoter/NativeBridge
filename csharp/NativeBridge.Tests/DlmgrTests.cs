@@ -518,12 +518,19 @@ namespace NativeBridgeF.Tests
                     prev = s.done;
                 }
                 Assert.That(prev, Is.EqualTo((ulong)data.Length), "终值必须精确等于 size");
-                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data), "续传拼回的数据必须完整");
             }
             finally
             {
                 DlmgrDLL.dlmgr_shutdown(mgr); // 先 join 再释放 sink（消费句柄）
                 DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            // 文件断言在 sink 释放后：Windows 下 sink 句柄锁着文件
+            try
+            {
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data), "续传拼回的数据必须完整");
+            }
+            finally
+            {
                 try { Directory.Delete(outDir, true); } catch { }
             }
         }
@@ -720,12 +727,19 @@ namespace NativeBridgeF.Tests
                 double sec = sw.Elapsed.TotalSeconds;
                 Assert.That(sec, Is.InRange(3.0, 7.0),
                             "6MB @1MB/s 应 ≈5s（含 1MB 突发），实测 " + sec.ToString("F2") + "s");
-                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
             }
             finally
             {
                 DlmgrDLL.dlmgr_shutdown(mgr);
                 DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            // 文件断言在 sink 释放后：Windows 下 sink 句柄锁着文件
+            try
+            {
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
                 try { Directory.Delete(outDir, true); } catch { }
             }
         }
@@ -762,12 +776,19 @@ namespace NativeBridgeF.Tests
                 double sec = sw.Elapsed.TotalSeconds;
                 Assert.That(sec, Is.InRange(4.2, 9.8),
                             "4MB @512KB/s 应 ≈7s（含 512KB 突发），实测 " + sec.ToString("F2") + "s");
-                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
             }
             finally
             {
                 DlmgrDLL.dlmgr_shutdown(mgr);
                 DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            // 文件断言在 sink 释放后：Windows 下 sink 句柄锁着文件
+            try
+            {
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
                 try { Directory.Delete(outDir, true); } catch { }
             }
         }
@@ -804,12 +825,19 @@ namespace NativeBridgeF.Tests
                 double sec = sw.Elapsed.TotalSeconds;
                 Assert.That(sec, Is.InRange(1.5, 5.0),
                             "中途解除限速应 <5s（全程限速 ≈11s），实测 " + sec.ToString("F2") + "s");
-                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
             }
             finally
             {
                 DlmgrDLL.dlmgr_shutdown(mgr);
                 DlmgrDLL.dlmgr_sink_release(sink);
+            }
+            // 文件断言在 sink 释放后：Windows 下 sink 句柄锁着文件
+            try
+            {
+                Assert.That(File.ReadAllBytes(outPath), Is.EqualTo(data));
+            }
+            finally
+            {
                 try { Directory.Delete(outDir, true); } catch { }
             }
         }
