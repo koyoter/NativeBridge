@@ -696,6 +696,11 @@ namespace NativeBridgeF.Tests
 
             var deletError = new ConcurrentQueue<string>();
             var deleterDone = new ManualResetEventSlim(false);
+            // 半程门：删除线程在前半批删完后停住等主线程刷过一轮，保证首轮刷新
+            // 必然落在"删了一半"状态（否则慢机上整批删除可先于首次 Wait(0) 完成，
+            // rounds==0 假失败——2026-10-24 mac runner 实际踩中）。
+            var midway = new ManualResetEventSlim(false);
+            var releaseRest = new ManualResetEventSlim(false);
 
             using (var reader = VfsReader.Open(_dir))
             {
@@ -710,6 +715,11 @@ namespace NativeBridgeF.Tests
                         for (int i = 0; i < FileCount; i++)
                         {
                             reader.Delete("gen-" + i);
+                            if (i == FileCount / 2)
+                            {
+                                midway.Set();
+                                releaseRest.Wait(30_000);
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -726,6 +736,12 @@ namespace NativeBridgeF.Tests
                 int rounds = 0;
                 try
                 {
+                    // 首轮刷新与未完成的后半批删除确定性并发（见上方半程门注释）
+                    midway.Wait(30_000);
+                    reader.RefreshIndex(); // 内部对 GenChanged 有界重试
+                    reader.EnsureMapping();
+                    rounds++;
+                    releaseRest.Set();
                     while (!deleterDone.Wait(0))
                     {
                         reader.RefreshIndex(); // 内部对 GenChanged 有界重试
