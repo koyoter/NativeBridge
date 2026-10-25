@@ -6,6 +6,15 @@ Blocks: —
 > **状态（2026-09-12）**：glue.rs / DownloadManager.cs / dist1.sh 打包均已落地，
 > `cargo test` 全量绿；下方"端到端集成测试 + 构建矩阵冒烟"**延后至 C# 端联调**
 > （2026-09-11 评审决策），本票在那之前不得关闭。
+>
+> **状态更新（2026-10-25）**：C# 端 e2e 已落地（DlmgrTests.cs：
+> DownloadIntoVfsSink_E2E / DownloadIntoVfs_PhysicalSizeStableDuringWrite /
+> DownloadIntoOneReader_CommitShutdownRejected_ThenReadSameInstance /
+> ConcurrentTasks_AllComplete_AndGlobalCountersMatch，及 Range 回退、退避、
+> 限速、crc/size mismatch 矩阵）；构建矩阵 21/21 CI 绿（v0.1.1，run 39103094178）。
+> killrecovery.ps1 人工运行**通过**（2026-10-25，Windows：stage1 flush 后整树杀，
+> stage2 重启恢复 1/1 绿；脚本当日补 UTF-8 BOM 修复 PS 5.1 解析）。
+> 验收标准各项均有对应覆盖与通过记录。
 
 ## 目标
 
