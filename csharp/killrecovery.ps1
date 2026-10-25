@@ -1,4 +1,4 @@
-# killrecovery.ps1 — T6 手动验证：中途杀进程 → 重启恢复语义
+﻿# killrecovery.ps1 — T6 手动验证：中途杀进程 → 重启恢复语义
 #   已 flush 的 commit 文件完好 Active；Downloading 残留条目被清理；可重新整理。
 #
 # 用法（需要能跑 NativeBridge.Tests 的环境：dotnet SDK + native DLL 在探测路径上）：
